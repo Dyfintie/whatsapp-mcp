@@ -1,0 +1,17 @@
+import {statfs,mkdir,chmod,stat} from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+process.umask(0o077);
+if(process.platform!=='linux')throw new Error('This release supports Linux; use a Linux VM on other systems.');
+const root=path.resolve(process.env.WHATSAPP_STATE_DIR || path.join(os.homedir(),'.whatsapp-mcp-public'));
+process.env.WHATSAPP_STATE_DIR=root;
+process.env.WHATSAPP_API_TOKEN_FILE ||= path.join(root,'api-token');
+process.env.WHATSAPP_DB_KEY_FILE ||= path.join(root,'database.key');
+process.env.WHATSAPP_TRANSFER_DIR ||= path.join('/dev/shm',`whatsapp-mcp-${process.getuid()}`);
+await mkdir(process.env.WHATSAPP_TRANSFER_DIR,{recursive:true,mode:0o700});
+const transferStat=await stat(process.env.WHATSAPP_TRANSFER_DIR);
+if(transferStat.uid!==process.getuid())throw new Error('Transfer directory must be owned by the current user.');
+await chmod(process.env.WHATSAPP_TRANSFER_DIR,0o700);
+if((await statfs(process.env.WHATSAPP_TRANSFER_DIR)).type!==0x01021994)throw new Error('Media transfer directory must be on tmpfs. Use encrypted swap or disable swap.');
+process.env.WHATSAPP_MCP_TRANSPORT=process.argv.includes('--daemon')?'http':'stdio';
+await import('../dist/index.js');

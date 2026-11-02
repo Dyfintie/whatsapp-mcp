@@ -1,0 +1,69 @@
+{
+  "name": "@dyfintie/whatsapp-mcp",
+  "version": "0.3.0",
+  "description": "Self-hosted WhatsApp MCP server with encrypted SQLite history, message search, media tools and a shared local daemon for AI agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "whatsapp-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "start": "node dist/index.js",
+    "start:http": "WHATSAPP_MCP_TRANSPORT=http node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepare": "npm run build",
+    "prepack": "npm run build",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "setup": "node scripts/setup.mjs",
+    "daemon": "node scripts/run.mjs --daemon",
+    "bridge": "node scripts/run.mjs"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md"
+  ],
+  "engines": {
+    "node": "24.22.x"
+  },
+  "keywords": [
+    "mcp",
+    "whatsapp",
+    "baileys",
+    "claude",
+    "llm",
+    "model-context-protocol",
+    "ai-tools",
+    "codex",
+    "cursor",
+    "self-hosted",
+    "encrypted-sqlite",
+    "whatsapp-mcp"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dyfintie/whatsapp-mcp.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "better-sqlite3-multiple-ciphers": "13.0.3",
+    "busboy": "1.6.0",
+    "https-proxy-agent": "^9.1.0",
+    "pino": "^10.3.1",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/busboy": "1.5.5",
+    "@types/node": "24.19.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
