@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# whatsapp-audio-setup: Manages PipeWire virtual audio sink & source for WhatsApp Web calling
+set -euo pipefail
+
+SINK_NAME="WhatsAppVirtualSink"
+SOURCE_NAME="WhatsAppVirtualMic"
+
+is_active() {
+    pactl list sources short 2>/dev/null | grep -q "${SOURCE_NAME}"
+}
+
+start_audio() {
+    if is_active; then
+        echo "WhatsApp virtual audio nodes are already active."
+        return 0
+    fi
+
+    echo "Creating PipeWire virtual audio sink and source..."
+    SINK_ID=$(pactl load-module module-null-sink sink_name="${SINK_NAME}" sink_properties=device.description="WhatsApp_Virtual_Sink")
+    SOURCE_ID=$(pactl load-module module-remap-source master="${SINK_NAME}.monitor" source_name="${SOURCE_NAME}" source_properties=device.description="WhatsApp_Virtual_Mic")
+
+    echo "Created sink module ${SINK_ID} and source module ${SOURCE_ID}."
+    echo "WhatsAppVirtualMic is now available as a system audio source."
+}
+
+stop_audio() {
+    echo "Stopping WhatsApp virtual audio nodes..."
+    # Find and unload modules associated with the sink and source
+    pactl list modules short 2>/dev/null | grep "${SINK_NAME}" | awk '{print $1}' | while read -r mod_id; do
+        pactl unload-module "$mod_id" 2>/dev/null || true
+    done
+    pactl list modules short 2>/dev/null | grep "${SOURCE_NAME}" | awk '{print $1}' | while read -r mod_id; do
+        pactl unload-module "$mod_id" 2>/dev/null || true
+    done
+    echo "Stopped."
+}
+
+status_audio() {
+    if is_active; then
+        echo "STATUS: ACTIVE"
+        echo "Sink:   ${SINK_NAME}"
+        echo "Source: ${SOURCE_NAME}"
+    else
+        echo "STATUS: INACTIVE"
+    fi
+}
+
+play_file() {
+    local file="${1:-}"
+    if [[ -z "$file" || ! -f "$file" ]]; then
+        echo "Error: File '$file' not found." >&2
+        return 1
+    fi
+    start_audio
+    echo "Streaming $file to WhatsAppVirtualMic..."
+    paplay -d "${SINK_NAME}" "$file"
+}
+
+speak_text() (
+    umask 077
+    local text="${1:-}"
+    local voice="${2:-ryan}"
+    if [[ -z "$text" ]]; then
+        echo "Error: No text provided." >&2
+        return 1
+    fi
+    if [[ ! "$voice" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        printf 'Error: Invalid local Piper voice: %s\n' "$voice" >&2
+        return 1
+    fi
+    local piper_model="${HOME}/.local/share/piper-voices/en_US-${voice}-medium.onnx"
+    if ! command -v piper >/dev/null 2>&1; then
+        printf 'Error: Local Piper executable is required.\n' >&2
+        return 1
+    fi
+    if [[ ! -f "$piper_model" || ! -r "$piper_model" ]]; then
+        printf 'Error: Requested local Piper model is unavailable: %s\n' "$piper_model" >&2
+        return 1
+    fi
+
+    local tmp_dir tmp_wav
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/whatsapp-tts.XXXXXXXX")
+    trap 'rm -rf -- "$tmp_dir"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    tmp_wav="$tmp_dir/speech.wav"
+    start_audio
+    printf '%s\n' "$text" | piper -m "$piper_model" -f "$tmp_wav" >/dev/null
+    if [[ ! -s "$tmp_wav" ]]; then
+        printf 'Error: Local Piper did not produce audio.\n' >&2
+        return 1
+    fi
+    paplay -d "${SINK_NAME}" "$tmp_wav"
+)
+
+case "${1:-status}" in
+    start)
+        start_audio
+        ;;
+    stop)
+        stop_audio
+        ;;
+    status)
+        status_audio
+        ;;
+    play)
+        shift
+        play_file "$@"
+        ;;
+    speak)
+        shift
+        speak_text "$@"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status|play <file>|speak <text> [voice=ryan]}"
+        exit 1
+        ;;
+esac

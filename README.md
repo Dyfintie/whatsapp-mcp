@@ -178,3 +178,31 @@ Contributions welcome through issues and pull requests. Never attach private log
 ## License and attribution
 
 MIT. Derived from [ydmw74/whatsapp-mcp-server](https://github.com/ydmw74/whatsapp-mcp-server); the original copyright notice is retained in [LICENSE](LICENSE). Uses [Baileys](https://github.com/WhiskeySockets/Baileys), the MCP TypeScript SDK, and [SQLite3 Multiple Ciphers](https://github.com/utelle/SQLite3MultipleCiphers).
+
+## Piper voice notes and browser calls
+
+Five optional tools are available: `whatsapp_call_dial`, `whatsapp_call_hangup`,
+`whatsapp_call_status`, `whatsapp_call_speak`, and `whatsapp_send_voice_note`.
+See [calling setup](calling/README.md) for Linux host dependencies and the separate
+WhatsApp Web login. Piper voice models are installed locally, not bundled.
+
+`whatsapp_send_voice_note` takes `chat_id`, `text`, optional `voice` (`ryan` or
+`lessac`), and a stable `request_id`. Recipient, text and voice determine its
+durable fingerprint. Repeating an uncertain operation never authorizes another
+send. Synthesized WAV files are staged privately inside the existing tmpfs uploads
+root, converted to verified Opus PTT, and cleaned up. Existing encryption,
+authenticated HTTP, attribution and upload containment remain in effect.
+
+Dial takes an exact `recipient`, optional `speak_on_connect`, `voice`, and
+`max_wait_seconds` (5–120). Direct HTTP clients should allow 240 seconds plus
+100 milliseconds per speech character; the stdio bridge adjusts its deadline.
+Concurrent daemon dials are guarded. Call tools have no durable request ledger:
+inspect call status after interruption and never automatically redial. Browser
+selectors depend on the WhatsApp Web version and language; a lookup fails if the
+UI cannot prove the requested identity. Timeout hangup does not prove remote
+termination. No live-call audibility or fixed latency is claimed by fixture tests.
+
+Run `npm test --prefix calling` and
+`python3 scripts/test-audio-helper.py calling/scripts/whatsapp-audio-setup` for the
+mocked browser/audio regressions. All real calls and sends require recipient and
+intent authorization.

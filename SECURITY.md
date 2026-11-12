@@ -34,3 +34,14 @@ Restore uses private tmpfs for temporary decrypted pages, then encrypts before c
 ## Release scope
 
 Public repository contains source, synthetic tests and generic documentation only. No personal working-tree documents, existing Git history, account state, phone numbers, media, or private configuration are included. Local tests establish implementation behavior, not account availability or a guarantee against all vulnerabilities.
+
+## Optional voice backend
+
+Piper voice-note WAV files are created under the protected tmpfs uploads root and
+removed after use. Voice models and browser profiles are local host dependencies.
+Browser calling uses a separate authenticated Chromium profile with microphone
+permissions and a loopback debugging endpoint. Protect that profile and endpoint
+as account credentials. Call actions have no durable operation ledger; a timeout
+may occur after a recipient has been reached. Never automatically redial or treat
+a timeout hangup request as proof of remote termination. Mocked tests do not prove
+recipient audibility. Authorization applies equally to calls and synthesized audio.

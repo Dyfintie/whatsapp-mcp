@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-call-manager",
+  "version": "1.0.0",
+  "description": "WhatsApp Web Automated Voice Calling via Puppeteer & PipeWire",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --experimental-test-module-mocks --test tests/call.test.mjs tests/cli.test.mjs",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "commander": "^13.0.0",
+    "puppeteer-core": "25.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "typescript": "^5.7.0"
+  },
+  "bin": {
+    "whatsapp-call": "dist/index.js"
+  }
+}

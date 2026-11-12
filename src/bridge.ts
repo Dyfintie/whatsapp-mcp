@@ -31,7 +31,10 @@ export async function startBridge() {
   });
   server.setRequestHandler(CallToolRequestSchema,async(request)=>{
     const c=await remote();
-    try{return await c.callTool(request.params,undefined,{timeout:120000});}
+    const name=request.params.name,args=request.params.arguments;
+    const speech=name==='whatsapp_call_dial'?args?.speak_on_connect:name==='whatsapp_call_speak'?args?.text:'';
+    const timeout=(name==='whatsapp_call_dial'?240000:120000)+(typeof speech==='string'?speech.length*100:0);
+    try{return await c.callTool(request.params,undefined,{timeout});}
     catch(e:any){
       await reset(c);
       // Reinitialize on the next call. Never replay a write (or an uncertain read with effects).

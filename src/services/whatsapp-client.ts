@@ -46,6 +46,8 @@ const execAsync = promisify(execFile);
 export const MAX_FILE_BYTES = 50 * 1024 * 1024;
 export const MAX_INLINE_BYTES = 4 * 1024 * 1024;
 
+interface SendSlot { active:number; pending:number }
+
 export class WhatsAppClient {
   private socket: any;
   private auth?: AuthStore;
@@ -60,6 +62,7 @@ export class WhatsAppClient {
   private pairing?: { phone: string; promise: Promise<string>; expires: number };
   private callbacks: Array<(status: ConnectionStatus)=>void> = [];
   private inFlight = new Set<Promise<any>>();
+  private sendSlots = new Set<SendSlot>();
   private transfers = 0;
   private events: Array<{at:string;state:ConnectionState;code?:number}> = [];
   private _status: ConnectionStatus = { connected:false,state:'starting',generation:0,changedAt:new Date().toISOString() };
@@ -275,67 +278,89 @@ export class WhatsAppClient {
       ...(['audio','voice'].includes(op.kind) && this.store.operation(watermarkRequestId(op.request_id))
         ? {watermark_request_id:watermarkRequestId(op.request_id)} : {})};
   }
-  private async send(chatId:string, fingerprint:string, kind:string, render:(index:number)=>{content:any;placeholder:any;prelude?:string}, requestId:string=randomUUID(), reservedAttributionIndex?:number) {
+  private async send(chatId:string, fingerprint:string, kind:string, render:(index:number)=>{content:any;placeholder:any;prelude?:string}, requestId:string=randomUUID(), reservedAttributionIndex?:number, sharedSlot?:SendSlot) {
     if(!/^[\w.:-]{1,128}$/.test(requestId))throw new ServiceError('INVALID_REQUEST_ID','Use 1-128 letters, digits, dots, colons, underscores or hyphens.');
     const old=this.store.operation(requestId);
     if(old) {
       if(old.fingerprint!==fingerprint)throw new ServiceError('REQUEST_ID_CONFLICT','This request_id has different content.');
       return this.operationResult(old);
     }
-    if(this.inFlight.size>=4)throw new ServiceError('BUSY','Too many sends are in progress.',true);
-    const jid=await this.recipient(chatId),sock=this.ensureConnected(),waId=generateMessageIDV2(sock.user?.id);
-    const key={remoteJid:jid,id:waId,fromMe:true},timestamp=Math.floor(Date.now()/1000);
-    let raced:any,attributionIndex=reservedAttributionIndex;
-    this.store.transaction(()=>{
-      if(attributionIndex===undefined) {
-        const reservation=this.store.reserveAttributedOperation(requestId,fingerprint,jid,waId,kind);
-        raced=reservation.created?undefined:reservation.operation;
-        attributionIndex=reservation.attributionIndex;
-      } else raced=this.store.beginOperation(requestId,fingerprint,jid,waId,kind);
-    });
-    if(raced)return this.operationResult(raced);
-    const rendered=render(attributionIndex!);
-    const {content,placeholder,prelude}=rendered;
-    if(prelude!==undefined) {
-      // Audio/voice players do not reliably render captions. Attribute them in
-      // a preceding text, with a durable child ID so retries never duplicate it.
-      try {
-        const intro=await this.sendMessage(jid,prelude,watermarkRequestId(requestId),attributionIndex);
-        if(['unknown','failed'].includes(intro.state))throw new ServiceError('WATERMARK_NOT_SUBMITTED','The attribution text could not be submitted.');
-      } catch {
-        this.store.operationState(requestId,'failed','WATERMARK_NOT_SUBMITTED');
-        return this.operationResult(this.store.operation(requestId));
+    if(!sharedSlot && this.sendSlots.size>=4)throw new ServiceError('BUSY','Too many sends are in progress.',true);
+    const slot=sharedSlot || {active:0,pending:0};
+    this.sendSlots.add(slot);++slot.active;
+    const release=()=>{if(!slot.active && !slot.pending)this.sendSlots.delete(slot);};
+    try {
+      const jid=await this.recipient(chatId),sock=this.ensureConnected(),waId=generateMessageIDV2(sock.user?.id);
+      const key={remoteJid:jid,id:waId,fromMe:true},timestamp=Math.floor(Date.now()/1000);
+      let raced:any,attributionIndex=reservedAttributionIndex;
+      this.store.transaction(()=>{
+        if(attributionIndex===undefined) {
+          const reservation=this.store.reserveAttributedOperation(requestId,fingerprint,jid,waId,kind);
+          raced=reservation.created?undefined:reservation.operation;
+          attributionIndex=reservation.attributionIndex;
+        } else raced=this.store.beginOperation(requestId,fingerprint,jid,waId,kind);
+      });
+      if(raced)return this.operationResult(raced);
+      const rendered=render(attributionIndex!);
+      const {content,placeholder,prelude}=rendered;
+      if(prelude!==undefined) {
+        // Audio/voice players do not reliably render captions. Attribute them in
+        // a preceding text, with a durable child ID so retries never duplicate it.
+        try {
+          const intro=await this.sendMessage(jid,prelude,watermarkRequestId(requestId),attributionIndex,slot);
+          if(['unknown','failed'].includes(intro.state))throw new ServiceError('WATERMARK_NOT_SUBMITTED','The attribution text could not be submitted.');
+        } catch {
+          this.store.operationState(requestId,'failed','WATERMARK_NOT_SUBMITTED');
+          return this.operationResult(this.store.operation(requestId));
+        }
       }
-    }
-    try {this.store.ingest({key,message:placeholder,messageTimestamp:timestamp},'submitted');}
-    catch(e){this.store.operationState(requestId,'failed','PERSISTENCE_FAILED');throw e;}
-    // Register before dispatch; a timeout does not authorize another send. The promise
-    // retains its slot and reconciles a late result. No background resend exists.
-    const pending=Promise.resolve().then(()=>sock.sendMessage(jid,content,{messageId:waId,mediaUploadTimeoutMs:45000})).then((result:any)=>{
-      if(!result?.key?.id || result.key.id!==waId) {
-        this.store.operationState(requestId,'unknown','SEND_RESULT_MISSING');return;
-      }
-      this.store.ingest(result,'submitted');
-    }).catch((_e:unknown)=>{this.store.operationState(requestId,'unknown','SEND_OUTCOME_UNKNOWN');});
-    this.inFlight.add(pending);pending.finally(()=>this.inFlight.delete(pending));
-    try { await deadline(pending,this.options.sendTimeoutMs || 60000); }
-    catch {this.store.operationState(requestId,'unknown','SEND_TIMEOUT');}
-    return this.operationResult(this.store.operation(requestId));
+      try {this.store.ingest({key,message:placeholder,messageTimestamp:timestamp},'submitted');}
+      catch(e){this.store.operationState(requestId,'failed','PERSISTENCE_FAILED');throw e;}
+      // Register before dispatch; a timeout does not authorize another send. The promise
+      // retains its slot and reconciles a late result. No background resend exists.
+      const pending=Promise.resolve().then(()=>sock.sendMessage(jid,content,{messageId:waId,mediaUploadTimeoutMs:45000})).then((result:any)=>{
+        if(!result?.key?.id || result.key.id!==waId) {
+          this.store.operationState(requestId,'unknown','SEND_RESULT_MISSING');return;
+        }
+        this.store.ingest(result,'submitted');
+      }).catch((_e:unknown)=>{this.store.operationState(requestId,'unknown','SEND_OUTCOME_UNKNOWN');});
+      ++slot.pending;
+      this.inFlight.add(pending);pending.finally(()=>{this.inFlight.delete(pending);--slot.pending;release();});
+      try { await deadline(pending,this.options.sendTimeoutMs || 60000); }
+      catch {this.store.operationState(requestId,'unknown','SEND_TIMEOUT');}
+      return this.operationResult(this.store.operation(requestId));
+    } finally {--slot.active;release();}
   }
-  async sendMessage(chatId:string,text:string,requestId?:string,reservedAttributionIndex?:number) {
+  async sendMessage(chatId:string,text:string,requestId?:string,reservedAttributionIndex?:number,sharedSlot?:SendSlot) {
     if(!text || text.length>4096)throw new ServiceError('INVALID_TEXT','Text must contain 1-4096 characters.');
     const jid=normalizeJid(chatId);
     const fingerprint=createHash('sha256').update(JSON.stringify({jid,kind:'text',text})).digest('hex');
     return this.send(jid,fingerprint,'text',index=>{
       const outgoing=withAttribution(text,index);
       return {content:{text:outgoing},placeholder:{conversation:outgoing}};
-    },requestId,reservedAttributionIndex);
+    },requestId,reservedAttributionIndex,sharedSlot);
   }
   private async transfer<T>(work:()=>Promise<T>) {
     if(this.transfers>=2)throw new ServiceError('TRANSFER_BUSY','Two transfers are already active.',true);
     ++this.transfers;try{return await work();}finally{--this.transfers;}
   }
-  async sendFile(chatId:string,filePath:string,opts:{kind?:'document'|'image'|'video'|'audio'|'voice';caption?:string;mimetype?:string;fileName?:string;request_id?:string}={}) {
+  async sendSynthesizedVoice(chatId:string,text:string,voice:'ryan'|'lessac',createAudio:()=>Promise<string>,requestId?:string) {
+    const jid=normalizeJid(chatId);
+    if(requestId!==undefined && !/^[\w.:-]{1,128}$/.test(requestId))throw new ServiceError('INVALID_REQUEST_ID','Invalid request_id.');
+    const fingerprint=createHash('sha256').update(JSON.stringify({jid,kind:'synthesized-voice',text,voice})).digest('hex');
+    const old=requestId?this.store.operation(requestId):undefined;
+    if(old) {
+      if(old.fingerprint!==fingerprint)throw new ServiceError('REQUEST_ID_CONFLICT','This request_id has different content.');
+      return this.operationResult(old);
+    }
+    await this.recipient(jid);
+    const file=await createAudio();
+    return this.sendFileInternal(jid,file,{kind:'voice',request_id:requestId,fileName:'voice-note.wav',mimetype:'audio/wav'},fingerprint);
+  }
+  async sendFile(chatId:string,filePath:string,opts:{kind?:'document'|'image'|'video'|'audio'|'voice';caption?:string;mimetype?:string;fileName?:string;request_id?:string;gifPlayback?:boolean}={}) {
+    return this.sendFileInternal(chatId,filePath,opts);
+  }
+  private async sendFileInternal(chatId:string,filePath:string,opts:{kind?:'document'|'image'|'video'|'audio'|'voice';caption?:string;mimetype?:string;fileName?:string;request_id?:string;gifPlayback?:boolean},semanticFingerprint?:string) {
     return this.transfer(async()=>{
       const jid=normalizeJid(chatId),kind=opts.kind || 'document';
       const source=await fs.realpath(filePath.startsWith('~/')?path.join(os.homedir(),filePath.slice(2)):path.resolve(filePath));
@@ -360,8 +385,8 @@ export class WhatsAppClient {
           if(bytes>MAX_FILE_BYTES){cb(new ServiceError('FILE_LIMIT','File exceeds 50 MiB.'));return;}hash.update(chunk);cb(null,chunk);}}),createWriteStream(snapshot,{flags:'wx',mode:0o600}));
         } finally {await handle.close();}
         const name=opts.fileName || path.basename(source);
-        const mime=opts.mimetype || ({'.pdf':'application/pdf','.png':'image/png','.jpg':'image/jpeg','.txt':'text/plain','.ogg':'audio/ogg','.mp3':'audio/mpeg','.mp4':'video/mp4'} as Record<string,string>)[path.extname(source).toLowerCase()] || 'application/octet-stream';
-        const fingerprint=createHash('sha256').update(JSON.stringify({jid,kind,caption:opts.caption || '',mimetype:mime,fileName:name,sha256:hash.digest('hex')})).digest('hex');
+        const mime=opts.mimetype || ({'.pdf':'application/pdf','.png':'image/png','.jpg':'image/jpeg','.gif':'image/gif','.txt':'text/plain','.ogg':'audio/ogg','.mp3':'audio/mpeg','.mp4':'video/mp4'} as Record<string,string>)[path.extname(source).toLowerCase()] || 'application/octet-stream';
+        const fingerprint=semanticFingerprint || createHash('sha256').update(JSON.stringify({jid,kind,caption:opts.caption || '',mimetype:mime,fileName:name,sha256:hash.digest('hex'),...(opts.gifPlayback?{gifPlayback:true}:{})})).digest('hex');
         let audio=snapshot;
         if(kind==='voice') {
           audio=path.join(dir,'voice.ogg');
@@ -369,14 +394,15 @@ export class WhatsAppClient {
           const {stdout}=await execAsync('ffprobe',['-v','error','-show_entries','stream=codec_name','-of','json',audio],{timeout:10000});
           if(JSON.parse(stdout).streams?.[0]?.codec_name!=='opus')throw new ServiceError('VOICE_CODEC','Converted audio is not Opus.');
         }
+        const mediaBytes=kind==='voice'?(await fs.stat(audio)).size:bytes;
         const audioOnly=kind==='audio' || kind==='voice';
         const field=kind==='voice'?'audio':kind;
         const result=await this.send(jid,fingerprint,kind,index=>{
           const caption=audioOnly?undefined:withAttribution(opts.caption,index);
           const content:any=kind==='voice'?{audio:{url:audio},ptt:true,mimetype:'audio/ogg; codecs=opus'}:
             kind==='audio'?{audio:{url:snapshot},mimetype:mime,ptt:false}:
-            {[kind]:{url:snapshot},mimetype:mime,fileName:name,caption};
-          const placeholder={[`${field}Message`]:{mimetype:mime,fileName:name,caption,fileLength:bytes,ptt:kind==='voice'}};
+            {[kind]:{url:snapshot},mimetype:mime,fileName:name,caption,...(opts.gifPlayback?{gifPlayback:true}:{})};
+          const placeholder={[`${field}Message`]:{mimetype:kind==='voice'?'audio/ogg; codecs=opus':mime,fileName:kind==='voice'?'voice-note.ogg':name,caption,fileLength:mediaBytes,ptt:kind==='voice',...(opts.gifPlayback?{gifPlayback:true}:{})}};
           return {content,placeholder,prelude:audioOnly?withAttribution(opts.caption || '',index):undefined};
         },opts.request_id);
         // An uncertain in-flight upload can still be reading its snapshot.

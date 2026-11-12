@@ -14,4 +14,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: npm ci
       - run: npm test
+      - run: npm ci --prefix calling
+      - run: npm test --prefix calling
+      - run: python3 scripts/test-audio-helper.py calling/scripts/whatsapp-audio-setup
+      - run: npm audit --prefix calling --audit-level=high
       - run: npm audit --audit-level=high

@@ -87,6 +87,7 @@ export const SendFileInputSchema = z.object({
   kind: z.enum(["document", "image", "video", "audio", "voice"])
     .optional()
     .describe("What to send. Use 'voice' for WhatsApp voice notes (ptt). Default: document"),
+  gifPlayback: z.boolean().optional().describe("Play video as a looping GIF."),
   caption: z.string()
     .max(4096)
     .optional()
@@ -101,6 +102,57 @@ export const SendFileInputSchema = z.object({
     .describe("Optional file name override for documents."),
 }).strict();
 
+export const CallDialInputSchema = z.object({
+  recipient: z.string()
+    .trim().min(1).max(200)
+    .describe("Phone number with country code (e.g. '+919876543210' or '919876543210') or contact name (e.g. 'Alice')"),
+  speak_on_connect: z.string()
+    .max(4096)
+    .optional()
+    .describe("Optional text to synthesize with Piper TTS and speak into the call as soon as the recipient answers"),
+  voice: z.enum(["ryan", "lessac"])
+    .optional()
+    .default("ryan")
+    .describe("Piper TTS neural voice: 'ryan' (crisp US male) or 'lessac' (studio US female)"),
+  max_wait_seconds: z.number()
+    .int()
+    .min(5)
+    .max(120)
+    .optional()
+    .default(45)
+    .describe("Maximum seconds to wait for recipient to answer before timing out (default: 45)"),
+}).strict();
+
+export const CallHangupInputSchema = z.object({}).strict();
+
+export const CallStatusInputSchema = z.object({}).strict();
+
+export const CallSpeakInputSchema = z.object({
+  text: z.string()
+    .min(1)
+    .max(4096)
+    .describe("Text to synthesize via Piper TTS and stream into the active call microphone"),
+  voice: z.enum(["ryan", "lessac"])
+    .optional()
+    .default("ryan")
+    .describe("Piper TTS neural voice: 'ryan' or 'lessac'"),
+}).strict();
+
+export const SendVoiceNoteInputSchema = z.object({
+  request_id: z.string().regex(/^[\w.:-]{1,128}$/).optional(),
+  chat_id: z.string()
+    .min(1)
+    .describe("WhatsApp chat ID (JID) or phone number with country code (e.g. '919876543210' or '919876543210@s.whatsapp.net')"),
+  text: z.string()
+    .min(1)
+    .max(4096)
+    .describe("Text to synthesize via Piper TTS into a natural voice note"),
+  voice: z.enum(["ryan", "lessac"])
+    .optional()
+    .default("ryan")
+    .describe("Piper TTS neural voice: 'ryan' (male) or 'lessac' (female)"),
+}).strict();
+
 export type GetStatusInput = z.infer<typeof GetStatusInputSchema>;
 export type ListChatsInput = z.infer<typeof ListChatsInputSchema>;
 export type SendMessageInput = z.infer<typeof SendMessageInputSchema>;
@@ -109,3 +161,9 @@ export type ListMessagesInput = z.infer<typeof ListMessagesInputSchema>;
 export type DownloadMediaInput = z.infer<typeof DownloadMediaInputSchema>;
 export type SendFileInput = z.infer<typeof SendFileInputSchema>;
 export type GetMediaInput = z.infer<typeof GetMediaInputSchema>;
+
+export type CallDialInput = z.infer<typeof CallDialInputSchema>;
+export type CallHangupInput = z.infer<typeof CallHangupInputSchema>;
+export type CallStatusInput = z.infer<typeof CallStatusInputSchema>;
+export type CallSpeakInput = z.infer<typeof CallSpeakInputSchema>;
+export type SendVoiceNoteInput = z.infer<typeof SendVoiceNoteInputSchema>;

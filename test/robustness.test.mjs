@@ -433,5 +433,45 @@ test('documented setup, daemon and stdio bridge expose tools offline',async t=>{
   const {StdioClientTransport}=await import('@modelcontextprotocol/sdk/client/stdio.js');
   const transport=new StdioClientTransport({command:process.execPath,args:['scripts/run.mjs'],env:{...env,WHATSAPP_MCP_URL:`http://127.0.0.1:${port}/mcp`},stderr:'pipe'});
   const client=new Client({name:'quickstart-test',version:'1'});
-  try {await client.connect(transport);assert.equal((await client.listTools()).tools.length,15);}finally{await client.close();}
+  try {await client.connect(transport);assert.equal((await client.listTools()).tools.length,20);}finally{await client.close();}
+});
+
+test('synthesized voice retries are durable, deduplicated and independent of audio randomness',async t=>{
+  const {client,sock,store,dir}=await fixture(t);open(sock);
+  let creates=0,sends=0,observedMime;
+  const original=sock.sendMessage;
+  sock.sendMessage=async(...args)=>{++sends;if(args[1].audio)observedMime=store.raw(pn,args[2].messageId).message.audioMessage.mimetype;return original(...args);};
+  const createAudio=async()=>{
+    ++creates;
+    const wav=path.join(client.transferRoot,'uploads',`random-${creates}.wav`);
+    // Minimal valid mono PCM WAV; no Piper or live audio service is involved.
+    const data=Buffer.alloc(44+3200);data.write('RIFF');data.writeUInt32LE(data.length-8,4);
+    data.write('WAVEfmt ',8);data.writeUInt32LE(16,16);data.writeUInt16LE(1,20);data.writeUInt16LE(1,22);
+    data.writeUInt32LE(16000,24);data.writeUInt32LE(32000,28);data.writeUInt16LE(2,32);data.writeUInt16LE(16,34);
+    data.write('data',36);data.writeUInt32LE(3200,40);await fs.writeFile(wav,data);return wav;
+  };
+  const first=await client.sendSynthesizedVoice(pn,'Hello','ryan',createAudio,'tts-retry');
+  assert.equal(first.state,'submitted');assert.equal(creates,1);assert.equal(sends,2);
+  const retry=await client.sendSynthesizedVoice(pn,'Hello','ryan',createAudio,'tts-retry');
+  assert.equal(retry.id,first.id);assert.equal(creates,1);assert.equal(sends,2);
+  for(const [text,voice] of [['Changed','ryan'],['Hello','lessac']])await assert.rejects(client.sendSynthesizedVoice(pn,text,voice,createAudio,'tts-retry'),e=>e.code==='REQUEST_ID_CONFLICT');
+  store.operationState('tts-retry','unknown','SEND_TIMEOUT');
+  assert.equal((await client.sendSynthesizedVoice(pn,'Hello','ryan',createAudio,'tts-retry')).state,'unknown');
+  assert.equal(creates,1);assert.equal(sends,2);
+  assert.equal(observedMime,'audio/ogg; codecs=opus');
+  const reopened=await MessageStore.open(path.join(dir,'messages.db'));
+  const restarted=new WhatsAppClient(path.join(dir,'other-auth'),reopened);
+  try {
+    assert.equal((await restarted.sendSynthesizedVoice(pn,'Hello','ryan',createAudio,'tts-retry')).id,first.id);
+    assert.equal(creates,1);
+  } finally {await restarted.disconnect();reopened.close();}
+});
+
+test('concurrent identical synthesized voice requests submit only once',async t=>{
+  const {client,sock,dir}=await fixture(t);open(sock);
+  let sends=0;const original=sock.sendMessage;sock.sendMessage=async(...args)=>{++sends;return original(...args);};
+  const audio=path.join(client.transferRoot,'uploads','voice.wav');
+  execFileSync('ffmpeg',['-nostdin','-v','error','-f','lavfi','-i','anullsrc=r=16000:cl=mono','-t','0.1',audio]);
+  const results=await Promise.all([1,2].map(()=>client.sendSynthesizedVoice(pn,'Hello','ryan',async()=>audio,'tts-race')));
+  assert.equal(results[0].id,results[1].id);assert.equal(sends,2);
 });

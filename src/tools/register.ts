@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { WhatsAppClient } from '../services/whatsapp-client.js';
 import { ServiceError } from '../services/errors.js';
+import { callService } from '../services/call-service.js';
 import * as S from '../schemas/index.js';
 
 const page={limit:z.number().int().min(1).max(100).default(20),offset:z.number().int().min(0).max(10000000).default(0)};
@@ -23,6 +24,7 @@ export function createMcpServer(client:WhatsAppClient) {
       annotations:{readOnlyHint:readOnly,destructiveHint:false,idempotentHint:readOnly,openWorldHint:source==='whatsapp'}},async(params:any)=>{
         try {
           const data=await fn(params);
+          if(data?.ok===false)throw new ServiceError('CALL_BACKEND_FAILED',String(data.error || 'Calling backend reported failure.'),false,{state:data.state});
           if(data?.state==='unknown' && name.startsWith('whatsapp_send_'))throw new ServiceError(data.errorCode || 'SEND_OUTCOME_UNKNOWN','Dispatch outcome is uncertain. Query this request_id; do not resend.',false,data);
           if(data?.state==='failed' && name.startsWith('whatsapp_send_'))throw new ServiceError(data.errorCode || 'SEND_FAILED','Send failed. Inspect the operation and any watermark_request_id before retrying.',false,data);
           return success(client,data,source);
@@ -54,6 +56,16 @@ export function createMcpServer(client:WhatsAppClient) {
   tool('whatsapp_get_group_info','Fetch current group metadata from WhatsApp.',S.GetGroupInfoInputSchema,true,p=>client.getGroupInfo(p.group_id),'whatsapp');
   tool('whatsapp_download_media','Stream media from its persisted envelope, including after restart. Historical exports without envelopes cannot be downloaded. Max 50 MiB; output_dir must be in the dedicated downloads directory.',S.DownloadMediaInputSchema,false,
     p=>client.downloadMedia(p.chat_id,p.message_id,p.output_dir),'whatsapp');
+  tool('whatsapp_call_dial','Call only the user-approved recipient. Do not automatically retry a timed-out dial; inspect call status first. Initiate a WhatsApp voice call to a phone number or contact name using WhatsApp Web calling daemon. Optionally synthesizes speech via Piper TTS and speaks into the call upon answering.',S.CallDialInputSchema,false,
+    p=>callService.dial(p.recipient,{speakOnConnect:p.speak_on_connect,voice:p.voice,maxWaitSeconds:p.max_wait_seconds}),'whatsapp');
+  tool('whatsapp_call_hangup','End the currently active WhatsApp voice call.',S.CallHangupInputSchema,false,
+    ()=>callService.hangup(),'whatsapp');
+  tool('whatsapp_call_status','Check whether a WhatsApp call is currently active, ringing, connected, or ended, along with elapsed duration.',S.CallStatusInputSchema,true,
+    ()=>callService.getStatus(),'service');
+  tool('whatsapp_call_speak','Synthesize speech using the local low-latency Piper TTS engine and stream it directly into the active WhatsApp call microphone.',S.CallSpeakInputSchema,false,
+    p=>callService.speak(p.text,p.voice),'whatsapp');
+  tool('whatsapp_send_voice_note','Send a Piper voice note only to the user-approved recipient. Supply a stable request_id to deduplicate retries; changed text or voice with the same ID is rejected. Submitted is not delivery. The daemon sends an attributed text prelude.',S.SendVoiceNoteInputSchema,false,
+    p=>callService.sendVoiceNote(client,p.chat_id,p.text,{voice:p.voice,request_id:p.request_id}),'whatsapp');
   server.registerTool('whatsapp_get_media',{description:'Return complete Base64 or data_url, up to 4 MiB decoded. Images use image blocks only for supported image MIME types; documents use resource blocks. Larger files require whatsapp_download_media.',
     inputSchema:S.GetMediaInputSchema,annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:true}},async(p:any)=>{
       try {
