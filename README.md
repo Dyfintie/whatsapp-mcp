@@ -6,6 +6,12 @@ Connect **Codex, Claude Desktop, Cursor, Antigravity, and other Model Context Pr
 
 [Quick start](#quick-start-linux) · [Connect your agent](#connect-your-agent) · [Tools](#available-tools) · [Security](SECURITY.md) · [Troubleshooting](#troubleshooting)
 
+## Learn how the system works
+
+- Run an offline exercise that stores, searches and revokes a synthetic message. [Hands-on walkthrough](docs/how-it-works.md)
+- See which process owns messaging, live calls, credentials and media. [High-level design](docs/high-level-design.md)
+- Trace a send from tool invocation through SQLite transactions, retries and delivery receipts. [Low-level design](docs/low-level-design.md)
+
 > Experimental, unofficial WhatsApp linked-device integration built on Baileys. Not affiliated with WhatsApp or Meta. Linking can fail or be revoked; this is not a guaranteed-uptime replacement for an official messaging API. Use responsibly and obtain recipients' consent. This release is tested on Linux; Windows/macOS users need a Linux VM and a local MCP client inside that VM.
 
 ## What you can do
@@ -121,6 +127,11 @@ Outgoing messages always identify the assistant: the first three reserved sends 
 | `whatsapp_get_group_info` | Live group metadata |
 | `whatsapp_download_media` | Download up to 50 MiB |
 | `whatsapp_get_media` | Inline media up to 4 MiB |
+| `whatsapp_send_voice_note` | Synthesize and send a Piper voice note |
+| `whatsapp_call_dial` | Dial a verified recipient using the calling browser |
+| `whatsapp_call_status` | Inspect the browser's current call state |
+| `whatsapp_call_speak` | Play synthesized speech into a connected call |
+| `whatsapp_call_hangup` | End the current call |
 
 `submitted` and `acknowledged` do not prove delivery. `delivered`/`read` need receipt evidence; group receipts may represent only one participant. A JID is a WhatsApp address, such as `15555550100@s.whatsapp.net`; opaque `@lid` identifiers must never be interpreted as phone numbers.
 
@@ -135,6 +146,9 @@ flowchart LR
   C --> E[Encrypted history and FTS]
   C --> F[Encrypted credentials]
   C --> G[Private tmpfs media staging]
+  C --> H[Optional calling CLI]
+  H --> I[WhatsApp Web calling profile]
+  I --> W
 ```
 
 Database encryption uses SQLite3 Multiple Ciphers in SQLCipher-4-compatible mode. Migration/relink backups use AES-256-GCM with a random nonce. Keys are local files, not sent to the project maintainers. This is not an independent security certification; read the [threat model and limitations](SECURITY.md).

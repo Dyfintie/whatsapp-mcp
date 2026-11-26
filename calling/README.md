@@ -8,8 +8,8 @@ Prerequisites: Node 24.22.0, Chromium at `/usr/sbin/chromium`, PipeWire's `pactl
 and `paplay`, and local Piper installed as `~/.local/bin/piper`. Install the
 requested voice model and its JSON configuration under
 `~/.local/share/piper-voices/en_US-{ryan,lessac}-medium.onnx[.json]`. Models and
-browser profiles are not bundled or committed. Set the Chromium executable in
-`src/config.ts` if the distribution uses another path, then rebuild.
+browser profiles are local to the host. Set `WHATSAPP_CHROMIUM_BIN` in the
+calling process environment if the distribution uses another executable path.
 
 From the repository root:
 
@@ -34,6 +34,12 @@ If that path already exists, inspect it and preserve its current target before
 replacing it. Ensure Node and `~/.local/bin` are on the daemon's PATH. Run
 `whatsapp-call login` interactively to link the dedicated browser profile.
 Login is an account setup action; it is not part of the test suite.
+
+The dedicated browser picks a loopback debugging port and records its port and
+instance ID in the calling profile. When upgrading from the fixed-port helper,
+close the old calling window before starting the updated helper against that
+profile. For initial linking, scan the QR code in the visible window. Login
+waits for the chat list. Status and hangup inspect an existing WhatsApp tab.
 
 Calls and voice notes contact real recipients. Obtain explicit recipient and
 intent authorization before invoking action tools. Exact recipient verification

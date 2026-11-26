@@ -22,11 +22,22 @@
   },
   "files": [
     "dist",
+    "docs",
+    "src",
+    "test/*.test.mjs",
+    "tsconfig.json",
     "scripts",
     "LICENSE",
     "README.md",
     "SECURITY.md",
-    "calling"
+    "calling/README.md",
+    "calling/package.json",
+    "calling/package-lock.json",
+    "calling/tsconfig.json",
+    "calling/scripts/whatsapp-audio-setup",
+    "calling/src/*.ts",
+    "calling/tests/*.test.mjs",
+    "calling/tests/fixtures/*.mjs"
   ],
   "engines": {
     "node": "24.22.x"
