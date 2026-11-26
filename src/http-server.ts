@@ -45,7 +45,8 @@ export async function startHttpServer(client:WhatsAppClient,options:{port?:numbe
   const closeSession=async(id:string)=>{const s=sessions.get(id);sessions.delete(id);if(s)await s.server.close();};
   async function upload(req:IncomingMessage,res:ServerResponse) {
     let dest:string | undefined,job:Promise<void> | undefined,failed=false;
-    const parser=Busboy({headers:req.headers,limits:{files:1,fields:0,parts:1,fileSize:MAX_FILE_BYTES,headerPairs:100}});
+    // Busboy signals partsLimit and file size limits when the threshold is reached.
+    const parser=Busboy({headers:req.headers,limits:{files:1,fields:0,parts:2,fileSize:MAX_FILE_BYTES+1,headerPairs:100}});
     let name='upload',size=0;
     parser.on('file',(_field,stream,info)=>{
       name=path.basename(info.filename || 'upload').replace(/[^a-zA-Z0-9._-]/g,'_').slice(-120) || 'upload';
@@ -55,6 +56,7 @@ export async function startHttpServer(client:WhatsAppClient,options:{port?:numbe
       job.catch(()=>{failed=true;});
     });
     parser.on('filesLimit',()=>{failed=true;});parser.on('fieldsLimit',()=>{failed=true;});
+    parser.on('partsLimit',()=>{failed=true;});
     try {
       let wireBytes=0;
       await pipeline(req,new Transform({transform(chunk,_enc,cb){wireBytes+=chunk.length;
@@ -74,11 +76,12 @@ export async function startHttpServer(client:WhatsAppClient,options:{port?:numbe
       // Verify the opened inode as well, closing a path/ancestor replacement race.
       const opened=await fs.realpath(`/proc/self/fd/${file.fd}`);
       const stat=await file.stat();
-      if(!inRoots(opened) || !stat.isFile())throw new ServiceError('PATH_FORBIDDEN','Not an allowed regular transfer file.');
+      if(!inRoots(opened) || !stat.isFile() || stat.nlink!==1)throw new ServiceError('PATH_FORBIDDEN','Not an allowed regular transfer file.');
       if(stat.size>MAX_FILE_BYTES)throw new ServiceError('TRANSFER_LIMIT','Download exceeds 50 MiB.');
       res.writeHead(200,{'content-type':'application/octet-stream','content-length':stat.size,'x-content-type-options':'nosniff',
         'content-disposition':`attachment; filename="${path.basename(real).replace(/[^a-zA-Z0-9._-]/g,'_')}"`});
-      await pipeline(file.createReadStream({autoClose:false}),res,{signal:AbortSignal.timeout(60000)});
+      if(stat.size===0) {res.end();return;}
+      await pipeline(file.createReadStream({autoClose:false,end:stat.size-1}),res,{signal:AbortSignal.timeout(60000)});
     } finally {await file.close();}
   }
   let port=requestedPort;
@@ -88,6 +91,7 @@ export async function startHttpServer(client:WhatsAppClient,options:{port?:numbe
     if(activeRequests>=64){json(res,429,{error:{code:'REQUEST_LIMIT'}});return;}
     ++activeRequests;let released=false;const release=()=>{if(!released){released=true;--activeRequests;}};
     res.once('close',release);res.once('finish',release);
+    let initializing=false, newServer:ReturnType<typeof createMcpServer> | undefined;
     try {
       const url=new URL(req.url || '/',`http://127.0.0.1:${port}`);
       if(url.pathname==='/healthz' && req.method==='GET') {json(res,200,{healthy:true,pid:process.pid});return;}
@@ -108,15 +112,17 @@ export async function startHttpServer(client:WhatsAppClient,options:{port?:numbe
       if(!entry) {
         if(req.method!=='POST' || !isInitializeRequest(body)){json(res,400,{error:{code:'INITIALIZE_REQUIRED'}});return;}
         if(sessions.size+pendingInitializations>=32){json(res,429,{error:{code:'SESSION_LIMIT'}});return;}
-        ++pendingInitializations;
-        try {
-          const server=createMcpServer(client);
-          const transport=new StreamableHTTPServerTransport({sessionIdGenerator:randomUUID,enableJsonResponse:true,
-            onsessioninitialized:newId=>{sessions.set(newId,created);},onsessionclosed:closedId=>{void closeSession(closedId);}});
-          const created={server,transport,touched:Date.now(),born:Date.now(),active:0};
-          await server.connect(transport);entry=created;
-          transport.onclose=()=>{for(const [k,v]of sessions)if(v===created)sessions.delete(k);};
-        } finally {--pendingInitializations;}
+        ++pendingInitializations;initializing=true;
+        const server=createMcpServer(client);
+        newServer=server;
+        const transport=new StreamableHTTPServerTransport({sessionIdGenerator:randomUUID,enableJsonResponse:true,
+          onsessioninitialized:newId=>{
+            sessions.set(newId,created);
+            --pendingInitializations;initializing=false;
+          },onsessionclosed:closedId=>{void closeSession(closedId);}});
+        const created={server,transport,touched:Date.now(),born:Date.now(),active:0};
+        await server.connect(transport);entry=created;
+        transport.onclose=()=>{for(const [k,v]of sessions)if(v===created)sessions.delete(k);};
       }
       // An idle SSE GET must not keep a session alive forever. Only POST work
       // prevents expiry while it is being processed.
@@ -127,6 +133,8 @@ export async function startHttpServer(client:WhatsAppClient,options:{port?:numbe
       if(res.headersSent){res.destroy();return;}
       const err=e instanceof ServiceError?e:new ServiceError('REQUEST_FAILED','The request could not be completed.');
       json(res,err.code==='PATH_FORBIDDEN'?403:err.code.includes('LIMIT') || err.code==='REQUEST_TOO_LARGE'?413:400,{error:{code:err.code,message:err.message}});
+    } finally {
+      if(initializing) {--pendingInitializations;await newServer?.close();}
     }
   })().catch(()=>{if(!res.headersSent)json(res,500,{error:{code:'INTERNAL_ERROR'}});else res.destroy();});});
   http.requestTimeout=70000;http.headersTimeout=10000;http.keepAliveTimeout=5000;

@@ -47,12 +47,20 @@ export const MAX_FILE_BYTES = 50 * 1024 * 1024;
 export const MAX_INLINE_BYTES = 4 * 1024 * 1024;
 
 interface SendSlot { active:number; pending:number }
+interface SendOptions {
+  requestId?: string; reservedAttributionIndex?: number; sharedSlot?: SendSlot; generation?: number;
+}
+interface FileOptions {
+  kind?: 'document'|'image'|'video'|'audio'|'voice';
+  caption?: string; mimetype?: string; fileName?: string; request_id?: string; gifPlayback?: boolean;
+}
 
 export class WhatsAppClient {
   private socket: any;
   private auth?: AuthStore;
   private generation = 0;
   private stopped = false;
+  private relinking = false;
   private connecting?: Promise<void>;
   private reconnectTimer?: NodeJS.Timeout;
   private stableTimer?: NodeJS.Timeout;
@@ -125,7 +133,7 @@ export class WhatsAppClient {
       }}, logger:this.logger, ...(agent?{agent,fetchAgent:agent}:{}),
       printQRInTerminal:false,generateHighQualityLinkPreview:false,syncFullHistory:false,
       connectTimeoutMs:30000,defaultQueryTimeoutMs:30000,markOnlineOnConnect:false,
-      getMessage:async(key:any)=>{try{return this.store.raw(key.remoteJid,key.id).message;}catch{return undefined;}},
+      getMessage:async(key:any)=>current() ? this.store.retryMessage(key) : undefined,
     });
     this.socket=sock;
     this.notify(auth.state.creds.registered?'reconnecting':'starting');
@@ -233,14 +241,20 @@ export class WhatsAppClient {
     return promise;
   }
   async relink(phone?:string) {
-    if(this.inFlight.size)throw new ServiceError('OPERATIONS_PENDING','Wait for pending operations before relinking.');
-    await this.disconnect(false);
-    this.auth ||= new AuthStore(this.authDir);
-    const backup=await this.auth.reset();
-    this.stopped=false; this.attempts=0; this.pairing=undefined;
-    await this.connect();
-    const code=phone?await this.requestPairingCode(phone):undefined;
-    return {backup,code,...this.status};
+    if(phone !== undefined && !/^[1-9]\d{6,14}$/.test(phone)) throw new ServiceError('INVALID_PHONE','Use country code and digits only.');
+    if(this._status.persistenceError) throw new ServiceError('PERSISTENCE_FAILED','Restore database persistence before relinking.');
+    if(this.relinking || this.sendSlots.size || this.transfers)
+      throw new ServiceError('OPERATIONS_PENDING','Wait for pending operations before relinking.');
+    this.relinking=true;
+    try {
+      await this.disconnect(false);
+      this.auth ||= new AuthStore(this.authDir);
+      const backup=await this.auth.reset();
+      this.stopped=false; this.attempts=0; this.pairing=undefined;
+      await this.connect();
+      const code=phone?await this.requestPairingCode(phone):undefined;
+      return {backup,code,...this.status};
+    } finally {this.relinking=false;}
   }
   async disconnect(closeAuth=true) {
     this.stopped=true;this.clearTimers();this.pairing=undefined;
@@ -251,14 +265,15 @@ export class WhatsAppClient {
     if(closeAuth) { await this.auth?.close(); this.auth=undefined; } else await this.auth?.flush();
     this.notify('failed',{errorCode:'STOPPED'});
   }
-  private ensureConnected() {
+  private ensureConnected(generation = this.generation) {
+    if(generation!==this.generation || this.relinking)throw new ServiceError('STALE_SOCKET','The WhatsApp connection changed before dispatch.');
     if(this._status.persistenceError)throw new ServiceError('PERSISTENCE_FAILED','Database persistence must recover before sending.');
     if(!this.isConnected)throw new ServiceError('NOT_CONNECTED','WhatsApp is not connected. Check status or relink.',false);
     return this.socket;
   }
-  private async recipient(input:string):Promise<string> {
+  private async recipient(input:string, generation:number):Promise<string> {
     const jid=this.store.canonical(normalizeJid(input));
-    const sock=this.ensureConnected();
+    const sock=this.ensureConnected(generation);
     if(jid.endsWith('@g.us')) { await deadline(sock.groupMetadata(jid),15000); return jid; }
     if(jid.endsWith('@lid')) {
       if(!this.store.db.prepare('SELECT 1 FROM wa_contacts WHERE jid=?').get(jid) && !this.store.db.prepare('SELECT 1 FROM chats WHERE chat_jid=?').get(jid))
@@ -278,7 +293,8 @@ export class WhatsAppClient {
       ...(['audio','voice'].includes(op.kind) && this.store.operation(watermarkRequestId(op.request_id))
         ? {watermark_request_id:watermarkRequestId(op.request_id)} : {})};
   }
-  private async send(chatId:string, fingerprint:string, kind:string, render:(index:number)=>{content:any;placeholder:any;prelude?:string}, requestId:string=randomUUID(), reservedAttributionIndex?:number, sharedSlot?:SendSlot) {
+  private async send(chatId:string, fingerprint:string, kind:string, render:(index:number)=>{content:any;placeholder:any;prelude?:string}, options:SendOptions) {
+    const {requestId=randomUUID(), reservedAttributionIndex, sharedSlot, generation=this.generation}=options;
     if(!/^[\w.:-]{1,128}$/.test(requestId))throw new ServiceError('INVALID_REQUEST_ID','Use 1-128 letters, digits, dots, colons, underscores or hyphens.');
     const old=this.store.operation(requestId);
     if(old) {
@@ -290,7 +306,7 @@ export class WhatsAppClient {
     this.sendSlots.add(slot);++slot.active;
     const release=()=>{if(!slot.active && !slot.pending)this.sendSlots.delete(slot);};
     try {
-      const jid=await this.recipient(chatId),sock=this.ensureConnected(),waId=generateMessageIDV2(sock.user?.id);
+      const jid=await this.recipient(chatId,generation),sock=this.ensureConnected(generation),waId=generateMessageIDV2(sock.user?.id);
       const key={remoteJid:jid,id:waId,fromMe:true},timestamp=Math.floor(Date.now()/1000);
       let raced:any,attributionIndex=reservedAttributionIndex;
       this.store.transaction(()=>{
@@ -314,11 +330,20 @@ export class WhatsAppClient {
           return this.operationResult(this.store.operation(requestId));
         }
       }
+      if (generation !== this.generation) {
+        this.store.operationState(requestId,'failed','STALE_SOCKET');
+        return this.operationResult(this.store.operation(requestId));
+      }
       try {this.store.ingest({key,message:placeholder,messageTimestamp:timestamp},'submitted');}
       catch(e){this.store.operationState(requestId,'failed','PERSISTENCE_FAILED');throw e;}
       // Register before dispatch; a timeout does not authorize another send. The promise
       // retains its slot and reconciles a late result. No background resend exists.
-      const pending=Promise.resolve().then(()=>sock.sendMessage(jid,content,{messageId:waId,mediaUploadTimeoutMs:45000})).then((result:any)=>{
+      const pending=Promise.resolve().then(async()=>{
+        if (generation !== this.generation) {
+          this.store.operationState(requestId,'failed','STALE_SOCKET');
+          return;
+        }
+        const result=await sock.sendMessage(jid,content,{messageId:waId,mediaUploadTimeoutMs:45000});
         if(!result?.key?.id || result.key.id!==waId) {
           this.store.operationState(requestId,'unknown','SEND_RESULT_MISSING');return;
         }
@@ -338,7 +363,7 @@ export class WhatsAppClient {
     return this.send(jid,fingerprint,'text',index=>{
       const outgoing=withAttribution(text,index);
       return {content:{text:outgoing},placeholder:{conversation:outgoing}};
-    },requestId,reservedAttributionIndex,sharedSlot);
+    },{requestId,reservedAttributionIndex,sharedSlot});
   }
   private async transfer<T>(work:()=>Promise<T>) {
     if(this.transfers>=2)throw new ServiceError('TRANSFER_BUSY','Two transfers are already active.',true);
@@ -353,63 +378,66 @@ export class WhatsAppClient {
       if(old.fingerprint!==fingerprint)throw new ServiceError('REQUEST_ID_CONFLICT','This request_id has different content.');
       return this.operationResult(old);
     }
-    await this.recipient(jid);
-    const file=await createAudio();
-    return this.sendFileInternal(jid,file,{kind:'voice',request_id:requestId,fileName:'voice-note.wav',mimetype:'audio/wav'},fingerprint);
-  }
-  async sendFile(chatId:string,filePath:string,opts:{kind?:'document'|'image'|'video'|'audio'|'voice';caption?:string;mimetype?:string;fileName?:string;request_id?:string;gifPlayback?:boolean}={}) {
-    return this.sendFileInternal(chatId,filePath,opts);
-  }
-  private async sendFileInternal(chatId:string,filePath:string,opts:{kind?:'document'|'image'|'video'|'audio'|'voice';caption?:string;mimetype?:string;fileName?:string;request_id?:string;gifPlayback?:boolean},semanticFingerprint?:string) {
+    const generation=this.generation;
     return this.transfer(async()=>{
-      const jid=normalizeJid(chatId),kind=opts.kind || 'document';
-      const source=await fs.realpath(filePath.startsWith('~/')?path.join(os.homedir(),filePath.slice(2)):path.resolve(filePath));
-      const uploads=await fs.realpath(path.join(this.transferRoot,'uploads'));
-      if(!source.startsWith(uploads+path.sep))throw new ServiceError('PATH_FORBIDDEN','Stage attachments inside the uploads directory.');
-      const stat=await fs.stat(source);
-      if(stat.nlink!==1)throw new ServiceError('PATH_FORBIDDEN','Hard-linked attachments are not allowed.');
-      if(!stat.isFile() || stat.size>MAX_FILE_BYTES)throw new ServiceError('FILE_LIMIT','Send a regular file no larger than 50 MiB.');
-      await fs.mkdir(this.transferRoot,{recursive:true,mode:0o700});
-      const dir=await fs.mkdtemp(path.join(this.transferRoot,'send-'));
-      let keepForPending=false;
-      try {
-        const snapshot=path.join(dir,'input');
-        const hash=createHash('sha256');let bytes=0;
-        const handle=await fs.open(source,constants.O_RDONLY | constants.O_NOFOLLOW);
-        try {
-          const opened=await fs.realpath(`/proc/self/fd/${handle.fd}`);
-          const openedStat=await handle.stat();
-          if(!opened.startsWith(uploads+path.sep) || !openedStat.isFile() || openedStat.nlink!==1)
-            throw new ServiceError('PATH_FORBIDDEN','Attachment changed outside uploads.');
-        await pipeline(handle.createReadStream({autoClose:false}),new Transform({transform(chunk,_enc,cb){bytes+=chunk.length;
-          if(bytes>MAX_FILE_BYTES){cb(new ServiceError('FILE_LIMIT','File exceeds 50 MiB.'));return;}hash.update(chunk);cb(null,chunk);}}),createWriteStream(snapshot,{flags:'wx',mode:0o600}));
-        } finally {await handle.close();}
-        const name=opts.fileName || path.basename(source);
-        const mime=opts.mimetype || ({'.pdf':'application/pdf','.png':'image/png','.jpg':'image/jpeg','.gif':'image/gif','.txt':'text/plain','.ogg':'audio/ogg','.mp3':'audio/mpeg','.mp4':'video/mp4'} as Record<string,string>)[path.extname(source).toLowerCase()] || 'application/octet-stream';
-        const fingerprint=semanticFingerprint || createHash('sha256').update(JSON.stringify({jid,kind,caption:opts.caption || '',mimetype:mime,fileName:name,sha256:hash.digest('hex'),...(opts.gifPlayback?{gifPlayback:true}:{})})).digest('hex');
-        let audio=snapshot;
-        if(kind==='voice') {
-          audio=path.join(dir,'voice.ogg');
-          await execAsync('ffmpeg',['-nostdin','-v','error','-i',snapshot,'-vn','-c:a','libopus','-b:a','64k','-n',audio],{timeout:60000,maxBuffer:100000});
-          const {stdout}=await execAsync('ffprobe',['-v','error','-show_entries','stream=codec_name','-of','json',audio],{timeout:10000});
-          if(JSON.parse(stdout).streams?.[0]?.codec_name!=='opus')throw new ServiceError('VOICE_CODEC','Converted audio is not Opus.');
-        }
-        const mediaBytes=kind==='voice'?(await fs.stat(audio)).size:bytes;
-        const audioOnly=kind==='audio' || kind==='voice';
-        const field=kind==='voice'?'audio':kind;
-        const result=await this.send(jid,fingerprint,kind,index=>{
-          const caption=audioOnly?undefined:withAttribution(opts.caption,index);
-          const content:any=kind==='voice'?{audio:{url:audio},ptt:true,mimetype:'audio/ogg; codecs=opus'}:
-            kind==='audio'?{audio:{url:snapshot},mimetype:mime,ptt:false}:
-            {[kind]:{url:snapshot},mimetype:mime,fileName:name,caption,...(opts.gifPlayback?{gifPlayback:true}:{})};
-          const placeholder={[`${field}Message`]:{mimetype:kind==='voice'?'audio/ogg; codecs=opus':mime,fileName:kind==='voice'?'voice-note.ogg':name,caption,fileLength:mediaBytes,ptt:kind==='voice',...(opts.gifPlayback?{gifPlayback:true}:{})}};
-          return {content,placeholder,prelude:audioOnly?withAttribution(opts.caption || '',index):undefined};
-        },opts.request_id);
-        // An uncertain in-flight upload can still be reading its snapshot.
-        if(this.inFlight.size) {keepForPending=true;void Promise.allSettled([...this.inFlight]).then(()=>fs.rm(dir,{recursive:true,force:true}));}
-        return result;
-      } finally {if(!keepForPending)await fs.rm(dir,{recursive:true,force:true});}
+      await this.recipient(jid,generation);
+      this.ensureConnected(generation);
+      const file=await createAudio();
+      this.ensureConnected(generation);
+      return this.sendFileInternal(jid,file,{kind:'voice',request_id:requestId,fileName:'voice-note.wav',mimetype:'audio/wav'},generation,fingerprint);
     });
+  }
+  async sendFile(chatId:string,filePath:string,opts:FileOptions={}) {
+    return this.transfer(()=>this.sendFileInternal(chatId,filePath,opts,this.generation));
+  }
+  private async sendFileInternal(chatId:string,filePath:string,opts:FileOptions,generation:number,semanticFingerprint?:string) {
+    const jid=normalizeJid(chatId),kind=opts.kind || 'document';
+    const source=await fs.realpath(filePath.startsWith('~/')?path.join(os.homedir(),filePath.slice(2)):path.resolve(filePath));
+    const uploads=await fs.realpath(path.join(this.transferRoot,'uploads'));
+    if(!source.startsWith(uploads+path.sep))throw new ServiceError('PATH_FORBIDDEN','Stage attachments inside the uploads directory.');
+    const stat=await fs.stat(source);
+    if(stat.nlink!==1)throw new ServiceError('PATH_FORBIDDEN','Hard-linked attachments are not allowed.');
+    if(!stat.isFile() || stat.size>MAX_FILE_BYTES)throw new ServiceError('FILE_LIMIT','Send a regular file no larger than 50 MiB.');
+    await fs.mkdir(this.transferRoot,{recursive:true,mode:0o700});
+    const dir=await fs.mkdtemp(path.join(this.transferRoot,'send-'));
+    let keepForPending=false;
+    try {
+      const snapshot=path.join(dir,'input');
+      const hash=createHash('sha256');let bytes=0;
+      const handle=await fs.open(source,constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const opened=await fs.realpath(`/proc/self/fd/${handle.fd}`);
+        const openedStat=await handle.stat();
+        if(!opened.startsWith(uploads+path.sep) || !openedStat.isFile() || openedStat.nlink!==1)
+          throw new ServiceError('PATH_FORBIDDEN','Attachment changed outside uploads.');
+      await pipeline(handle.createReadStream({autoClose:false}),new Transform({transform(chunk,_enc,cb){bytes+=chunk.length;
+        if(bytes>MAX_FILE_BYTES){cb(new ServiceError('FILE_LIMIT','File exceeds 50 MiB.'));return;}hash.update(chunk);cb(null,chunk);}}),createWriteStream(snapshot,{flags:'wx',mode:0o600}));
+      } finally {await handle.close();}
+      const name=opts.fileName || path.basename(source);
+      const mime=opts.mimetype || ({'.pdf':'application/pdf','.png':'image/png','.jpg':'image/jpeg','.gif':'image/gif','.txt':'text/plain','.ogg':'audio/ogg','.mp3':'audio/mpeg','.mp4':'video/mp4'} as Record<string,string>)[path.extname(source).toLowerCase()] || 'application/octet-stream';
+      const fingerprint=semanticFingerprint || createHash('sha256').update(JSON.stringify({jid,kind,caption:opts.caption || '',mimetype:mime,fileName:name,sha256:hash.digest('hex'),...(opts.gifPlayback?{gifPlayback:true}:{})})).digest('hex');
+      let audio=snapshot;
+      if(kind==='voice') {
+        audio=path.join(dir,'voice.ogg');
+        await execAsync('ffmpeg',['-nostdin','-v','error','-i',snapshot,'-vn','-c:a','libopus','-b:a','64k','-n',audio],{timeout:60000,maxBuffer:100000});
+        const {stdout}=await execAsync('ffprobe',['-v','error','-show_entries','stream=codec_name','-of','json',audio],{timeout:10000});
+        if(JSON.parse(stdout).streams?.[0]?.codec_name!=='opus')throw new ServiceError('VOICE_CODEC','Converted audio is not Opus.');
+      }
+      const mediaBytes=kind==='voice'?(await fs.stat(audio)).size:bytes;
+      const audioOnly=kind==='audio' || kind==='voice';
+      const field=kind==='voice'?'audio':kind;
+      const result=await this.send(jid,fingerprint,kind,index=>{
+        const caption=audioOnly?undefined:withAttribution(opts.caption,index);
+        const content:any=kind==='voice'?{audio:{url:audio},ptt:true,mimetype:'audio/ogg; codecs=opus'}:
+          kind==='audio'?{audio:{url:snapshot},mimetype:mime,ptt:false}:
+          {[kind]:{url:snapshot},mimetype:mime,fileName:name,caption,...(opts.gifPlayback?{gifPlayback:true}:{})};
+        const placeholder={[`${field}Message`]:{mimetype:kind==='voice'?'audio/ogg; codecs=opus':mime,fileName:kind==='voice'?'voice-note.ogg':name,caption,fileLength:mediaBytes,ptt:kind==='voice',...(opts.gifPlayback?{gifPlayback:true}:{})}};
+        return {content,placeholder,prelude:audioOnly?withAttribution(opts.caption || '',index):undefined};
+      },{requestId:opts.request_id,generation});
+      // An uncertain in-flight upload can still be reading its snapshot.
+      if(this.inFlight.size) {keepForPending=true;void Promise.allSettled([...this.inFlight]).then(()=>fs.rm(dir,{recursive:true,force:true}));}
+      return result;
+    } finally {if(!keepForPending)await fs.rm(dir,{recursive:true,force:true});}
   }
   async downloadMedia(chatId:string,messageId:string,outputDir?:string,maxBytes=MAX_FILE_BYTES) {
     return this.transfer(async()=>{

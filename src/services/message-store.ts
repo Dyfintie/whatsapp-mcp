@@ -31,21 +31,26 @@ export class MessageStore {
   static async open(file: string): Promise<MessageStore> {
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
     const db = new DatabaseSync(file);
-    chmodSync(file, 0o600);
-    db.exec("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON");
-    const hasMigrations = db.prepare("SELECT 1 FROM sqlite_master WHERE name='wa_migrations'").get();
-    const migrated = hasMigrations && db.prepare("SELECT 1 FROM wa_migrations WHERE version IN (2,4) GROUP BY 1 HAVING COUNT(*)=2").get();
-    let dest: string | undefined;
-    if (!migrated && db.prepare("SELECT 1 FROM sqlite_master WHERE name='messages'").get()) {
-      dest = `${file}.pre-robustness-${Date.now()}.bak`;
-      await backup(db, dest); chmodSync(dest, 0o600);
+    try {
+      chmodSync(file, 0o600);
+      db.exec("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON");
+      const hasMigrations = db.prepare("SELECT 1 FROM sqlite_master WHERE name='wa_migrations'").get();
+      const migrated = hasMigrations && db.prepare("SELECT 1 FROM wa_migrations WHERE version IN (2,4,5) GROUP BY 1 HAVING COUNT(*)=3").get();
+      let dest: string | undefined;
+      if (!migrated && db.prepare("SELECT 1 FROM sqlite_master WHERE name='messages'").get()) {
+        dest = `${file}.pre-robustness-${Date.now()}.bak`;
+        await backup(db, dest); chmodSync(dest, 0o600);
+      }
+      db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL");
+      const store = new MessageStore(db, file, dest);
+      store.migrate();
+      // A previous daemon may have died after dispatch. Never replay these writes.
+      db.prepare("UPDATE wa_operations SET state='unknown', error_code='PROCESS_RESTART', updated_at=? WHERE state='submitted'").run(new Date().toISOString());
+      return store;
+    } catch (error) {
+      db.close();
+      throw error;
     }
-    db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL");
-    const store = new MessageStore(db, file, dest);
-    store.migrate();
-    // A previous daemon may have died after dispatch. Never replay these writes.
-    db.prepare("UPDATE wa_operations SET state='unknown', error_code='PROCESS_RESTART', updated_at=? WHERE state='submitted'").run(new Date().toISOString());
-    return store;
   }
   transaction<T>(work: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
@@ -81,6 +86,7 @@ export class MessageStore {
           receipt_state TEXT NOT NULL, deleted_at TEXT, edited_at TEXT,
           UNIQUE(jid,wa_id,from_me,participant));
         CREATE INDEX IF NOT EXISTS wa_protocol_id ON wa_protocol(jid,wa_id);
+        CREATE INDEX IF NOT EXISTS wa_protocol_wa_id ON wa_protocol(wa_id);
         CREATE TABLE IF NOT EXISTS wa_contacts(jid TEXT PRIMARY KEY, name TEXT, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS wa_lid_mappings(lid TEXT PRIMARY KEY, pn TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS wa_receipts(jid TEXT NOT NULL, wa_id TEXT NOT NULL, recipient TEXT NOT NULL,
@@ -151,6 +157,18 @@ export class MessageStore {
         }
         this.db.prepare("INSERT INTO wa_migrations VALUES(4,?)").run(new Date().toISOString());
       }
+      if (!this.db.prepare("SELECT 1 FROM wa_migrations WHERE version=5").get()) {
+        // Older receipts identify the chat and recipient, but omit direction and group sender.
+        this.db.exec(`ALTER TABLE wa_receipts RENAME TO wa_receipts_v4;
+          CREATE TABLE wa_receipts(
+            jid TEXT NOT NULL, wa_id TEXT NOT NULL, from_me INTEGER NOT NULL CHECK(from_me IN (-1,0,1)),
+            participant TEXT NOT NULL, recipient TEXT NOT NULL, state TEXT NOT NULL,
+            evidence TEXT NOT NULL CHECK(json_valid(evidence)), updated_at TEXT NOT NULL,
+            PRIMARY KEY(jid,wa_id,from_me,participant,recipient));
+          INSERT INTO wa_receipts SELECT jid,wa_id,-1,'',recipient,state,evidence,updated_at FROM wa_receipts_v4;
+          DROP TABLE wa_receipts_v4;`);
+        this.db.prepare("INSERT INTO wa_migrations VALUES(5,?)").run(new Date().toISOString());
+      }
     });
   }
   canonical(jid: string) {
@@ -189,17 +207,24 @@ export class MessageStore {
     }
     return row;
   }
-  private findProtocol(key: any): any {
-    if (!key.remoteJid || !key.id) return undefined;
-    const aliases = this.aliases(key.remoteJid);
-    let sql = `SELECT * FROM wa_protocol WHERE jid IN (${aliases.map(()=>"?")}) AND wa_id=?`;
-    const args: any[] = [...aliases,key.id];
+  private protocolRows(key: any, identityOnly = false): any[] {
+    if (!key?.id) return [];
+    let sql = `SELECT ${identityOnly ? "jid,from_me,participant" : "*"} FROM wa_protocol WHERE wa_id=?`;
+    const args: any[] = [key.id];
+    if (key.remoteJid) {
+      const chats = this.aliases(key.remoteJid);
+      sql += ` AND jid IN (${chats.map(()=>"?")})`; args.push(...chats);
+    }
     if (key.fromMe != null) { sql += " AND from_me=?"; args.push(Number(Boolean(key.fromMe))); }
-    if (key.participant && key.remoteJid.endsWith("@g.us") && !key.fromMe) {
+    if (key.participant && (!key.remoteJid || key.remoteJid.endsWith("@g.us")) && !key.fromMe) {
       const peers = this.aliases(key.participant);
       sql += ` AND participant IN (${peers.map(()=>"?")})`; args.push(...peers);
     }
-    const rows = this.db.prepare(sql).all(...args);
+    return this.db.prepare(sql + " LIMIT 2").all(...args);
+  }
+  private findProtocol(key: any): any {
+    if (!key?.remoteJid) return undefined;
+    const rows = this.protocolRows(key);
     if (rows.length > 1) throw new ServiceError("AMBIGUOUS_MESSAGE", "More than one message matches this protocol identity.");
     return rows[0];
   }
@@ -217,39 +242,42 @@ export class MessageStore {
       this.update(protocol.key, protocol.editedMessage ? { message: protocol.editedMessage } : { message: null });
       return;
     }
-    return this.transaction(() => {
-      const existing = this.findProtocol(key);
-      const raw = stringify(msg);
-      const media = mediaMeta(msg.message);
-      const state = explicitState || (key.fromMe ? this.stateFromStatus(msg.status) || "submitted" : "received");
-      let id: number;
-      if (existing) {
-        id = Number(existing.message_id);
-        // A late echo fills a placeholder, but must not resurrect a deleted/edited message.
-        if (msg.message && !existing.deleted_at && !existing.edited_at) {
-          this.db.prepare("UPDATE wa_protocol SET raw=?,media=? WHERE message_id=?").run(raw,media ? stringify(media):null,id);
-          const {text,type} = messageText(msg.message);
-          this.db.prepare("UPDATE messages SET text_content=?,message_type=? WHERE message_id=?").run(text,type,id);
-        }
-      } else {
-        const jid = this.canonical(key.remoteJid);
-        const sender = key.fromMe ? "me" : (key.participant || key.remoteJid);
-        const chat = this.chat(jid, !key.fromMe && !jid.endsWith("@g.us") ? msg.pushName : undefined);
+    return this.transaction(() => this.persistEnvelope(msg, explicitState));
+  }
+  // Called inside the transaction that owns the message or deletion event.
+  private persistEnvelope(msg: any, explicitState?: Outcome): number {
+    const key = msg.key;
+    const existing = this.findProtocol(key);
+    const raw = stringify(msg);
+    const media = mediaMeta(msg.message);
+    const state = explicitState || (key.fromMe ? this.stateFromStatus(msg.status) || "submitted" : "received");
+    let id: number;
+    if (existing) {
+      id = Number(existing.message_id);
+      // A late echo fills a placeholder, but must not resurrect a deleted/edited message.
+      if (msg.message && !existing.deleted_at && !existing.edited_at) {
+        this.db.prepare("UPDATE wa_protocol SET raw=?,media=? WHERE message_id=?").run(raw,media ? stringify(media):null,id);
         const {text,type} = messageText(msg.message);
-        const dt = new Date(seconds(msg.messageTimestamp)*1000);
-        const utc = dt.toISOString().slice(0,19).replace("T"," ");
-        const pad=(n:number)=>String(n).padStart(2,"0");
-        const local = `${dt.getFullYear()}-${pad(dt.getMonth()+1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
-        const r = this.db.prepare(`INSERT INTO messages(chat_id,chat_name,is_from_me,sender_phone,sender_name,message_type,text_content,timestamp_utc,timestamp_local,status)
-          VALUES(?,?,?,?,?,?,?,?,?,?)`).run(chat.chat_id,chat.chat_name,Number(Boolean(key.fromMe)),key.fromMe ? "me" : phoneOf(this.canonical(sender)),
-            key.fromMe?"Me":msg.pushName || sender,type,text,utc,local,state);
-        id=Number(r.lastInsertRowid);
-        this.db.prepare("INSERT INTO wa_protocol(message_id,jid,wa_id,from_me,participant,raw,media,sender_jid,receipt_state) VALUES(?,?,?,?,?,?,?,?,?)")
-          .run(id,jid,key.id,Number(Boolean(key.fromMe)),jid.endsWith("@g.us") && !key.fromMe ? this.canonical(key.participant || ""):"",raw,media?stringify(media):null,sender,state);
+        this.db.prepare("UPDATE messages SET text_content=?,message_type=? WHERE message_id=?").run(text,type,id);
       }
-      if (key.fromMe) this.advance(key,state);
-      return id;
-    });
+    } else {
+      const jid = this.canonical(key.remoteJid);
+      const sender = key.fromMe ? "me" : (key.participant || key.remoteJid);
+      const chat = this.chat(jid, !key.fromMe && !jid.endsWith("@g.us") ? msg.pushName : undefined);
+      const {text,type} = messageText(msg.message);
+      const dt = new Date(seconds(msg.messageTimestamp)*1000);
+      const utc = dt.toISOString().slice(0,19).replace("T"," ");
+      const pad=(n:number)=>String(n).padStart(2,"0");
+      const local = `${dt.getFullYear()}-${pad(dt.getMonth()+1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+      const r = this.db.prepare(`INSERT INTO messages(chat_id,chat_name,is_from_me,sender_phone,sender_name,message_type,text_content,timestamp_utc,timestamp_local,status)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`).run(chat.chat_id,chat.chat_name,Number(Boolean(key.fromMe)),key.fromMe ? "me" : phoneOf(this.canonical(sender)),
+          key.fromMe?"Me":msg.pushName || sender,type,text,utc,local,state);
+      id=Number(r.lastInsertRowid);
+      this.db.prepare("INSERT INTO wa_protocol(message_id,jid,wa_id,from_me,participant,raw,media,sender_jid,receipt_state) VALUES(?,?,?,?,?,?,?,?,?)")
+        .run(id,jid,key.id,Number(Boolean(key.fromMe)),jid.endsWith("@g.us") && !key.fromMe ? this.canonical(key.participant || ""):"",raw,media?stringify(media):null,sender,state);
+    }
+    if (key.fromMe) this.advance(key,state);
+    return id;
   }
   stateFromStatus(status: number): Outcome | undefined {
     return ({0:"failed",1:"submitted",2:"acknowledged",3:"delivered",4:"read",5:"read"} as Record<number,Outcome>)[status];
@@ -271,17 +299,14 @@ export class MessageStore {
     }
   }
   private completeKey(key: any, kind:string, payload:unknown): any | undefined {
-    if(key?.remoteJid && key?.id)return key;
-    if(key?.id && !key.remoteJid) {
-      const direction=key.fromMe == null ? '' : ' AND from_me=?';
-      const args:any[]=[key.id];if(key.fromMe != null)args.push(Number(Boolean(key.fromMe)));
-      const rows=this.db.prepare(`SELECT DISTINCT jid,from_me,participant FROM wa_protocol WHERE wa_id=?${direction}`).all(...args);
-      if(rows.length===1)return {...key,remoteJid:rows[0].jid,fromMe:Boolean(rows[0].from_me),participant:key.participant || rows[0].participant || undefined};
-    }
+    if (key?.id && key.remoteJid && key.fromMe != null &&
+        (key.fromMe || !key.remoteJid.endsWith("@g.us") || key.participant)) return key;
+    const rows = this.protocolRows(key, true);
+    if (rows.length === 1) return {...key, remoteJid:rows[0].jid, fromMe:Boolean(rows[0].from_me), participant:rows[0].participant || undefined};
     // A partial receipt is not a database failure. Retain it privately without
     // inventing a recipient or claiming delivery for an ambiguous message.
-    this.db.prepare(`INSERT INTO wa_receipts VALUES(?,?,?,?,?,?)
-      ON CONFLICT(jid,wa_id,recipient) DO UPDATE SET evidence=excluded.evidence,updated_at=excluded.updated_at`)
+    this.db.prepare(`INSERT INTO wa_receipts VALUES(?,?,-1,'',?,?,?,?)
+      ON CONFLICT DO UPDATE SET evidence=excluded.evidence,updated_at=excluded.updated_at`)
       .run('',String(key?.id || ''),`unresolved:${kind}`,'unmatched',stringify(payload),new Date().toISOString());
     return undefined;
   }
@@ -289,8 +314,13 @@ export class MessageStore {
     key=this.completeKey(key,'message-update',{key,update});if(!key)return;
 
     this.transaction(() => {
-      const row = this.findProtocol(key);
-      if (row && "message" in update) {
+      let row = this.findProtocol(key);
+      if (!row && update.message === null) {
+        // A revoke may precede the original history sync. Record its identity now.
+        this.persistEnvelope({key}, key.fromMe ? "unknown" : undefined);
+        row = this.findProtocol(key);
+      }
+      if (row && !row.deleted_at && update.message !== undefined) {
         const raw = parse(row.raw) || { key };
         raw.message = update.message;
         const deleted = update.message == null;
@@ -309,9 +339,11 @@ export class MessageStore {
     if (!state) return;
     this.transaction(() => {
       const jid=this.canonical(key.remoteJid), peer=receipt.userJid || "unknown";
-      const prev=this.db.prepare("SELECT state FROM wa_receipts WHERE jid=? AND wa_id=? AND recipient=?").get(jid,key.id,peer);
-      if (!prev || ranks[state]>ranks[String(prev.state)]) this.db.prepare("INSERT OR REPLACE INTO wa_receipts VALUES(?,?,?,?,?,?)")
-        .run(jid,key.id,peer,state,stringify(receipt),new Date().toISOString());
+      const participant = jid.endsWith("@g.us") && !key.fromMe ? this.canonical(key.participant || "") : "";
+      this.db.prepare(`INSERT INTO wa_receipts VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT DO UPDATE SET state=excluded.state,evidence=excluded.evidence,updated_at=excluded.updated_at
+        WHERE excluded.state='read' AND wa_receipts.state='delivered'`)
+        .run(jid,key.id,Number(Boolean(key.fromMe)),participant,peer,state,stringify(receipt),new Date().toISOString());
       // For groups these states mean evidence from at least one recipient, never all members.
       this.advance(key,state);
     });
@@ -319,8 +351,14 @@ export class MessageStore {
   list(q: MessageQuery = {}): any[] {
     const args:any[]=[]; const where:string[]=[];
     if (q.chat_id) { const aliases=this.aliases(normalizeJid(q.chat_id)); where.push(`c.chat_jid IN (${aliases.map(()=>"?")})`); args.push(...aliases); }
-    if (q.before) { where.push("m.timestamp_utc < ?"); args.push(new Date(q.before).toISOString().slice(0,19).replace("T"," ")); }
-    if (q.after) { where.push("m.timestamp_utc >= ?"); args.push(new Date(q.after).toISOString().slice(0,19).replace("T"," ")); }
+    // Keep a nonzero fractional bound when comparing to stored whole-second UTC time.
+    const utcBound = (date: string) => {
+      const seconds = new Date(date).toISOString().slice(0,19).replace("T"," ");
+      const fraction = date.match(/\.\d+/)?.[0] || "";
+      return /[1-9]/.test(fraction) ? seconds + fraction : seconds;
+    };
+    if (q.before) { where.push("m.timestamp_utc < ?"); args.push(utcBound(q.before)); }
+    if (q.after) { where.push("m.timestamp_utc >= ?"); args.push(utcBound(q.after)); }
     if(q.query) { where.push("m.message_id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)"); args.push(q.query); }
     const rows=this.db.prepare(`SELECT m.*,c.chat_jid,p.wa_id,p.sender_jid,p.media,p.receipt_state,p.deleted_at,p.edited_at FROM messages m
       JOIN chats c ON m.chat_id=c.chat_id LEFT JOIN wa_protocol p ON p.message_id=m.message_id
@@ -338,12 +376,24 @@ export class MessageStore {
   getMessage(jid: string, id: string) {
     const key={remoteJid:normalizeJid(jid),id};
     const row=id.startsWith("db:") ? { message_id:Number(id.slice(3)) } : this.findProtocol(key);
-    const r=row && this.db.prepare(`SELECT m.*,c.chat_jid,p.wa_id,p.sender_jid,p.media,p.receipt_state,p.deleted_at,p.edited_at
+    const r=row && this.db.prepare(`SELECT m.*,c.chat_jid,p.wa_id,p.participant,p.from_me,p.sender_jid,p.media,p.receipt_state,p.deleted_at,p.edited_at
       FROM messages m JOIN chats c ON c.chat_id=m.chat_id LEFT JOIN wa_protocol p ON p.message_id=m.message_id WHERE m.message_id=?`).get(row.message_id);
     if (!r || !this.aliases(key.remoteJid).includes(String(r.chat_jid))) throw new ServiceError("MESSAGE_NOT_FOUND","No stored message matches this chat and ID.");
-    const aliases=this.aliases(key.remoteJid);
-    return {...this.present(r), receipts:this.db.prepare(`SELECT recipient,state,updated_at FROM wa_receipts WHERE jid IN (${aliases.map(()=>"?")}) AND wa_id=?`).all(...aliases,id),
+    return {...this.present(r), receipts:r.wa_id ? this.messageReceipts(r) : [],
       receiptScope:String(r.chat_jid).endsWith("@g.us")?"at_least_one_recipient":"direct"};
+  }
+  private messageReceipts(row: any) {
+    const chats = this.aliases(row.chat_jid);
+    const participants = row.participant ? this.aliases(row.participant) : [""];
+    const unique = this.protocolRows({remoteJid:row.chat_jid,id:row.wa_id}, true).length === 1;
+    // Legacy evidence is usable only while its chat and ID match exactly one message.
+    // Aliases or a migration can supply several records for the same recipient.
+    return this.db.prepare(`SELECT recipient,state,updated_at FROM (
+      SELECT recipient,state,updated_at,row_number() OVER (
+        PARTITION BY recipient ORDER BY (state='read') DESC,updated_at DESC) AS position
+      FROM wa_receipts WHERE jid IN (${chats.map(()=>"?")}) AND wa_id=?
+        AND ((from_me=? AND participant IN (${participants.map(()=>"?")})) OR (from_me=-1 AND ?)))
+      WHERE position=1 ORDER BY recipient`).all(...chats,row.wa_id,row.from_me,...participants,Number(unique));
   }
   raw(jid: string, id: string) {
     const row=this.findProtocol({remoteJid:jid,id});
@@ -351,6 +401,12 @@ export class MessageStore {
     const raw=parse(row?.raw);
     if (!raw?.message || !mediaMeta(raw.message)) throw new ServiceError("MEDIA_UNAVAILABLE","No persisted media envelope is available. Historical exports cannot reconstruct media keys.");
     return raw;
+  }
+  retryMessage(key: any) {
+    if (!key?.remoteJid) return undefined;
+    const rows = this.protocolRows(key);
+    if (rows.length === 1 && !rows[0].deleted_at) return parse(rows[0].raw)?.message;
+    return undefined;
   }
   chats(limit=20,offset=0,query="") {
     return this.db.prepare(`SELECT chat_jid AS id,chat_name AS name,chat_type,total_messages,last_activity,target_phone

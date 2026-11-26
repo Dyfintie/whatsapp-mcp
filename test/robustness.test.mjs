@@ -114,6 +114,11 @@ test('offline queries paginate and filter dates; unverified historical delivery 
   const {store}=await fixture(t);store.ingest(message('early'));store.ingest({...message('late'),messageTimestamp:200});
   assert.equal(store.list({limit:1})[0].id,'late');assert.equal(store.list({limit:1,offset:1})[0].id,'early');
   assert.equal(store.list({before:'1970-01-01T00:02:30Z'}).length,1);assert.equal(store.getMessage(pn,'early').id,'early');
+  for (const bound of ['1970-01-01T00:01:40.123Z','1970-01-01T01:01:40.000001+01:00']) {
+    assert.deepEqual(store.list({before:bound}).map(m=>m.id),['early']);
+    assert.deepEqual(store.list({after:bound}).map(m=>m.id),['late']);
+  }
+  assert.equal(store.list({before:'1970-01-01T00:01:40.000Z'}).length,0);
 });
 test('LID mappings from protocol reconcile later phone echoes without fabricated phone',async t=>{
   const {store}=await fixture(t);const lid='25585673842711@lid';
@@ -192,6 +197,8 @@ test('HTTP headers, simultaneous sessions, malformed inputs, transfer path and s
   const form=new FormData();form.set('file',new Blob(['test attachment']), 'test.txt');
   const upload=await fetch(base+'/upload',{method:'POST',body:form});assert.equal(upload.status,200);const info=await upload.json();
   assert.equal(await (await fetch(base+'/download?path='+encodeURIComponent(info.path))).text(),'test attachment');
+  await fs.link(info.path,path.join(client.transferRoot,'uploads','copy-of-fixture'));
+  assert.equal((await fetch(base+'/download?path='+encodeURIComponent(info.path))).status,403);
   const old=ta.sessionId;await sleep(600);
   assert.equal((await fetch(base+'/mcp',{headers:{'mcp-session-id':old,accept:'text/event-stream'}})).status,404);
   await Promise.all([a.close(),b.close()]);
@@ -421,8 +428,13 @@ test('documented setup, daemon and stdio bridge expose tools offline',async t=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'wa-quickstart-'));
   const transfers=await fs.mkdtemp('/dev/shm/wa-quickstart-');
   const env={...process.env,WHATSAPP_STATE_DIR:root,WHATSAPP_TRANSFER_DIR:transfers,WHATSAPP_HTTP_PORT:'0',WHATSAPP_OFFLINE:'true'};
-  delete env.WHATSAPP_DB_KEY_FILE;delete env.WHATSAPP_API_TOKEN_FILE;
+  env.WHATSAPP_DB_KEY_FILE=path.join(root,'keys','database');
+  env.WHATSAPP_API_TOKEN_FILE=path.join(root,'keys','api-token');
   execFileSync(process.execPath,['scripts/setup.mjs'],{env});
+  const token=await fs.readFile(env.WHATSAPP_API_TOKEN_FILE,'utf8');
+  execFileSync(process.execPath,['scripts/setup.mjs'],{env});
+  assert.equal(await fs.readFile(env.WHATSAPP_API_TOKEN_FILE,'utf8'),token);
+  assert.ok((await fs.stat(path.join(transfers,'uploads'))).isDirectory());
   const daemon=spawn(process.execPath,['scripts/run.mjs','--daemon'],{env,stdio:['ignore','ignore','pipe']});
   t.after(async()=>{if(daemon.exitCode===null && daemon.signalCode===null){const exited=new Promise(r=>daemon.once('exit',r));daemon.kill('SIGTERM');await exited;}await fs.rm(root,{recursive:true,force:true});await fs.rm(transfers,{recursive:true,force:true});});
   const port=await new Promise((resolve,reject)=>{
@@ -431,9 +443,13 @@ test('documented setup, daemon and stdio bridge expose tools offline',async t=>{
     daemon.stderr.on('data',chunk=>{output+=chunk;for(const line of output.split('\n')){try{const v=JSON.parse(line);if(v.event==='listening'){clearTimeout(timer);resolve(v.port);}}catch{}}});
   });
   const {StdioClientTransport}=await import('@modelcontextprotocol/sdk/client/stdio.js');
-  const transport=new StdioClientTransport({command:process.execPath,args:['scripts/run.mjs'],env:{...env,WHATSAPP_MCP_URL:`http://127.0.0.1:${port}/mcp`},stderr:'pipe'});
+  const transport=new StdioClientTransport({command:process.execPath,args:['scripts/run.mjs'],env:{...env,WHATSAPP_TRANSFER_DIR:path.join(root,'unused-by-bridge'),WHATSAPP_MCP_URL:`http://127.0.0.1:${port}/mcp`},stderr:'pipe'});
   const client=new Client({name:'quickstart-test',version:'1'});
-  try {await client.connect(transport);assert.equal((await client.listTools()).tools.length,20);}finally{await client.close();}
+  try {await client.connect(transport);assert.equal((await client.listTools()).tools.length,20);
+    const result=await client.callTool({name:'whatsapp_list_messages',arguments:{limit:1}});
+    assert.deepEqual(result.structuredContent.data,[]);
+    assert.equal(result.structuredContent.source,'sqlite');
+    await assert.rejects(fs.stat(path.join(root,'unused-by-bridge')),e=>e.code==='ENOENT');}finally{await client.close();}
 });
 
 test('synthesized voice retries are durable, deduplicated and independent of audio randomness',async t=>{
@@ -474,4 +490,211 @@ test('concurrent identical synthesized voice requests submit only once',async t=
   execFileSync('ffmpeg',['-nostdin','-v','error','-f','lavfi','-i','anullsrc=r=16000:cl=mono','-t','0.1',audio]);
   const results=await Promise.all([1,2].map(()=>client.sendSynthesizedVoice(pn,'Hello','ryan',async()=>audio,'tts-race')));
   assert.equal(results[0].id,results[1].id);assert.equal(sends,2);
+});
+
+test('socket retry lookup returns text for the exact direction and group participant', async t => {
+  const {store,sock} = await fixture(t);
+  const group = '123456789@g.us';
+  const key = {remoteJid:group, id:'shared', fromMe:false, participant:pn};
+  const other = {...key, participant:'15555550101@s.whatsapp.net'};
+  const outgoing = {remoteJid:group, id:'shared', fromMe:true};
+  for (const [identity, text] of [[key,'first'],[other,'second'],[outgoing,'outgoing']]) {
+    store.ingest({key:identity, message:{conversation:text}, messageTimestamp:100});
+    assert.deepEqual(await sock.config.getMessage(identity), {conversation:text});
+  }
+  assert.equal(await sock.config.getMessage({remoteJid:group, id:'shared'}), undefined);
+  assert.throws(() => store.raw(group,'shared'), e => e.code === 'AMBIGUOUS_MESSAGE');
+  store.update(key, {message:undefined});
+  assert.deepEqual(await sock.config.getMessage(key), {conversation:'first'});
+  store.update(key, {message:null});
+  assert.equal(await sock.config.getMessage(key), undefined);
+  assert.deepEqual(await sock.config.getMessage(other), {conversation:'second'});
+});
+
+test('revocations survive later edits and history replay in either arrival order', async t => {
+  const {store,sock} = await fixture(t);
+  const editing = {documentMessage:{caption:'resurrected',mimetype:'application/pdf'}};
+  for (const arrivesFirst of [false,true]) {
+    const msg = message('revocation-' + arrivesFirst);
+    if (!arrivesFirst) store.ingest(msg);
+    sock.ev.emit('messages.delete',{keys:[msg.key]});
+    const deletedAt = store.getMessage(pn,msg.key.id).deletedAt;
+    sock.ev.emit('messages.update',[{key:msg.key,update:{message:editing}}]);
+    sock.ev.emit('messages.upsert',{messages:[msg]});
+    const row = store.getMessage(pn,msg.key.id);
+    assert.ok(deletedAt);
+    assert.equal(row.deletedAt,deletedAt);
+    assert.equal(row.type,'deleted');
+    assert.equal(row.text,'');
+    assert.equal(await sock.config.getMessage(msg.key),undefined);
+    assert.throws(() => store.raw(pn,msg.key.id),e => e.code === 'MEDIA_UNAVAILABLE');
+  }
+  assert.equal(store.list({query:'resurrected OR searchable'}).length,0);
+});
+
+test('a partial receipt with a known chat does not cross directions or stop ingestion', async t => {
+  const {client,sock,store} = await fixture(t);
+  open(sock);
+  const sent = await client.sendMessage(pn,'outgoing','ambiguous-receipt');
+  store.ingest(message(sent.id));
+  sock.ev.emit('message-receipt.update',[{key:{remoteJid:pn,id:sent.id},receipt:{readTimestamp:200}}]);
+  assert.equal(client.isConnected,true);
+  assert.equal(client.diagnostics().unmatchedProtocolEvents,1);
+  assert.equal(store.operation('ambiguous-receipt').state,'submitted');
+  sock.ev.emit('messages.upsert',{messages:[message('still-ingesting')]});
+  assert.equal(store.getMessage(pn,'still-ingesting').text,'unique searchable fixture');
+});
+
+test('relink cannot reset credentials while a send verifies a recipient or synthesizes audio', async t => {
+  const {client,sock} = await fixture(t);
+  open(sock);
+  let release, entered;
+  const gate = new Promise(resolve => {release = resolve;});
+  const started = new Promise(resolve => {entered = resolve;});
+  sock.onWhatsApp = async jid => {entered(); await gate; return [{jid,exists:true}];};
+  const send = client.sendMessage(pn,'sample','pending-relink');
+  await started;
+  try {await assert.rejects(client.relink(),e => e.code === 'OPERATIONS_PENDING');} finally {release();}
+  assert.equal((await send).state,'submitted');
+
+  let finish, synthesizing;
+  const holdAudio = new Promise(resolve => {finish = resolve;});
+  const beganAudio = new Promise(resolve => {synthesizing = resolve;});
+  const voice = client.sendSynthesizedVoice(pn,'sample','ryan',async () => {
+    synthesizing();
+    await holdAudio;
+    throw new Error('fixture synthesis ended');
+  },'audio-relink');
+  await beganAudio;
+  try {await assert.rejects(client.relink(),e => e.code === 'OPERATIONS_PENDING');} finally {finish();}
+  await assert.rejects(voice,/fixture synthesis ended/);
+  assert.equal(client.isConnected,true);
+});
+
+test('a new socket cannot dispatch a send verified by an older connection', async t => {
+  const {client,sock,sockets,store} = await fixture(t);
+  sock.config.auth.creds.registered = true;
+  open(sock);
+  let release;
+  sock.onWhatsApp = jid => new Promise(resolve => {release = () => resolve([{jid,exists:true}]);});
+  const send = client.sendMessage(pn,'sample','old-socket');
+  close(sock,515);
+  await new Promise(resolve => client.onConnection(status => {if(status.generation > 2) resolve();}));
+  open(sockets[1]);
+  sockets[1].sendMessage = () => assert.fail('A replacement connection received an old send');
+  release();
+  await assert.rejects(send,e => e.code === 'STALE_SOCKET');
+  assert.equal(store.operation('old-socket'),undefined);
+});
+
+test('upload accepts exactly 50 MiB and removes extra or oversized parts', async t => {
+  const {client,dir} = await fixture(t);
+  const http = await startHttpServer(client,{port:0});
+  t.after(() => http.close());
+  const limit = 50 * 1024 * 1024, sample = path.join(dir,'sample.bin');
+  const uploads = path.join(client.transferRoot,'uploads');
+  await fs.writeFile(sample,'');
+  const {openAsBlob} = await import('node:fs');
+  async function post(size, addPart) {
+    await fs.truncate(sample,size);
+    const form = new FormData();
+    form.append('file',await openAsBlob(sample),'sample.bin');
+    if (addPart) form.append('extra','extra');
+    return fetch('http://127.0.0.1:'+http.port+'/upload',{method:'POST',body:form});
+  }
+  const exact = await post(limit,false);
+  assert.equal(exact.status,200);
+  const staged = await exact.json();
+  assert.equal(staged.size,limit);
+  await fs.unlink(staged.path);
+  for (const [size,extra] of [[limit+1,false],[16,true]]) {
+    const response = await post(size,extra);
+    assert.equal(response.status,413);
+    assert.equal((await response.json()).error.code,'TRANSFER_LIMIT');
+    assert.deepEqual(await fs.readdir(uploads),[]);
+  }
+});
+
+test('version 4 receipts survive migration and stay scoped to an unambiguous message', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(),'wa-receipt-migration-'));
+  t.after(() => fs.rm(dir,{recursive:true,force:true}));
+  const file = path.join(dir,'history.sqlite');
+  const old = await MessageStore.open(file);
+  const incoming = message('shared-receipt');
+  const incomingId = old.ingest(incoming);
+  const other = message('unique-receipt');
+  old.ingest(other);
+  // Reconstruct the on-disk receipt format shipped before direction was persisted.
+  old.db.exec(`DROP TABLE wa_receipts;
+    CREATE TABLE wa_receipts(jid TEXT,wa_id TEXT,recipient TEXT,state TEXT,evidence TEXT,updated_at TEXT,
+      PRIMARY KEY(jid,wa_id,recipient));
+    DELETE FROM wa_migrations WHERE version=5`);
+  const legacy = old.db.prepare('INSERT INTO wa_receipts VALUES(?,?,?,?,?,?)');
+  for (const msg of [incoming,other]) legacy.run(pn,msg.key.id,pn,'read','{}','2025-01-01');
+  old.close();
+
+  const store = await MessageStore.open(file);
+  try {
+    assert.equal((await fs.readFile(store.migrationBackup)).subarray(0,8).toString(),'WAMCPBK1');
+    assert.equal(store.getMessage(pn,other.key.id).receipts[0].state,'read');
+    assert.equal(store.getMessage(pn,'db:'+incomingId).receipts[0].state,'read');
+    const outgoing = {...incoming.key,fromMe:true};
+    const outgoingId = store.ingest({...incoming,key:outgoing});
+    assert.deepEqual(store.getMessage(pn,'db:'+incomingId).receipts,[]);
+    assert.deepEqual(store.getMessage(pn,'db:'+outgoingId).receipts,[]);
+    store.receipt(outgoing,{userJid:pn,receiptTimestamp:200});
+    store.receipt(incoming.key,{userJid:pn,readTimestamp:300});
+    assert.equal(store.getMessage(pn,'db:'+incomingId).receipts[0].state,'read');
+    assert.equal(store.getMessage(pn,'db:'+outgoingId).receipts[0].state,'delivered');
+  } finally {store.close();}
+  const reopened = await MessageStore.open(file);
+  try {assert.equal(reopened.migrationBackup,undefined);} finally {reopened.close();}
+});
+
+test('group receipt details distinguish two senders reusing the same ID', async t => {
+  const {store} = await fixture(t);
+  const group = '123456789@g.us';
+  const key = {remoteJid:group,id:'shared',fromMe:false,participant:pn};
+  const otherKey = {...key,participant:'15555550101@s.whatsapp.net'};
+  const first = store.ingest(message('shared',{key}));
+  const second = store.ingest(message('shared',{key:otherKey}));
+  store.receipt(key,{userJid:pn,readTimestamp:200});
+  store.receipt(otherKey,{userJid:pn,receiptTimestamp:200});
+  assert.equal(store.getMessage(group,'db:'+first).receipts[0].state,'read');
+  assert.equal(store.getMessage(group,'db:'+second).receipts[0].state,'delivered');
+});
+
+test('HTTP reserves capacity through SDK initialization and releases failed attempts', async t => {
+  const {client} = await fixture(t);
+  const http = await startHttpServer(client,{port:0});
+  t.after(() => http.close());
+  const {StreamableHTTPServerTransport} = await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
+  const handle = StreamableHTTPServerTransport.prototype.handleRequest;
+  const gate = Promise.withResolvers(), full = Promise.withResolvers();
+  let waiting = 0;
+  t.mock.method(StreamableHTTPServerTransport.prototype,'handleRequest',async function(req,res,body) {
+    if (++waiting === 32) full.resolve();
+    await gate.promise;
+    return handle.call(this,req,res,body);
+  });
+  const initialize = (accept='application/json, text/event-stream') => fetch('http://127.0.0.1:'+http.port+'/mcp',{
+    method:'POST',headers:{'content-type':'application/json',accept},signal:AbortSignal.timeout(10000),
+    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{
+      protocolVersion:'2025-03-26',capabilities:{},clientInfo:{name:'fixture',version:'1'},
+    }}),
+  });
+  const firstBatch = Promise.all(Array.from({length:32},(_,index)=>initialize(index===0?'text/plain':undefined)));
+  try {
+    await Promise.race([full.promise,sleep(4000)]);
+    assert.equal(waiting,32);
+    const rejected = await initialize();
+    assert.equal(rejected.status,429);
+    assert.equal((await rejected.json()).error.code,'SESSION_LIMIT');
+  } finally {gate.resolve();await firstBatch;}
+  for (const response of await firstBatch) await response.text();
+  assert.equal(http.sessions.size,31);
+  const replacement = await initialize();
+  assert.equal(replacement.status,200);
+  await replacement.text();
+  assert.equal(http.sessions.size,32);
 });
