@@ -28,6 +28,7 @@ test('JSON dial speech keeps real audio progress on stderr', () => {
   assert.equal(result.json.spoken, true);
   assert.match(result.stderr, /Speaking into call/);
   assert.match(result.stderr, /MOCK audio speak/);
+  assert.doesNotMatch(result.stderr, /Hello/);
 });
 
 test('invalid waits fail before audio or browser work', () => {
@@ -70,7 +71,8 @@ test('speak audio failure returns JSON error and disconnects', () => {
   const result = run(['speak', 'Hello'], 'audio_error');
   assert.equal(result.status, 1);
   assert.equal(result.json.ok, false);
-  assert.match(result.json.error, /Mock audio failure/);
+  assert.match(result.json.error, /audio helper failed/);
+  assert.doesNotMatch(result.stderr + result.stdout, /Hello/);
   assert.match(result.stderr, /MOCK disconnect/);
 });
 
@@ -78,4 +80,27 @@ test('hangup progress does not contaminate JSON', () => {
   const result = run(['hangup']);
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.json, { ok: true, state: 'ended' });
+});
+
+test('inspection commands leave an absent calling page or daemon alone', () => {
+  for (const state of ['missing_page', 'daemon_not_running']) {
+    const status = run(['status'], state);
+    assert.deepEqual(status.json, { ok: true, active: false, state: state === 'missing_page' ? 'idle' : state });
+    const hangup = run(['hangup'], state);
+    const speak = run(['speak', 'sample'], state);
+    assert.equal(hangup.json.ok, state === 'missing_page');
+    assert.equal(speak.json.ok, false);
+    for (const result of [status, hangup, speak]) assert.doesNotMatch(result.stderr, /launch-capable|MOCK audio|MOCK hangup/);
+  }
+});
+
+test('login waits for a visible chat list and releases the connection on timeout', () => {
+  const result = spawnSync(process.execPath, [
+    '--experimental-test-module-mocks', '--import', './tests/fixtures/cli-runtime.mjs', './dist/index.js', 'login',
+  ], { cwd: root, encoding: 'utf8', env: { ...process.env, TEST_CALL_STATE: 'login_timeout' }, timeout: 10000 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Timed out waiting for the chat list/);
+  assert.match(result.stderr, /MOCK disconnect/);
+  assert.doesNotMatch(result.stdout, /successful|snapshot saved/);
 });

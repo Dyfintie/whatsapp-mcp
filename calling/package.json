@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --experimental-test-module-mocks --test tests/call.test.mjs tests/cli.test.mjs",
+    "test": "npm run build && node --experimental-test-module-mocks --test tests/*.test.mjs",
     "start": "node dist/index.js"
   },
   "dependencies": {

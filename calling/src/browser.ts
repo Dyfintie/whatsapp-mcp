@@ -1,98 +1,86 @@
-import os from 'node:os';
+import { readFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import puppeteer, { Browser, Page } from 'puppeteer-core';
-import { spawn } from 'child_process';
 import { CONFIG } from './config.js';
 
-export async function isCdpAvailable(): Promise<boolean> {
+async function runningEndpoint(): Promise<string | undefined> {
+  let record: string;
   try {
-    const res = await fetch(`${CONFIG.cdpUrl}/json/version`, { signal: AbortSignal.timeout(1500) });
-    return res.ok;
-  } catch {
-    return false;
+    record = await readFile(path.join(CONFIG.userDataDir, 'DevToolsActivePort'), 'utf8');
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return undefined;
+    throw err;
   }
+  const [port, socketPath] = record.trim().split(/\r?\n/);
+  if (!/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535 ||
+      !/^\/devtools\/browser\/[a-zA-Z0-9-]+$/.test(socketPath || '')) return undefined;
+
+  const host = '127.0.0.1:' + port;
+  const expected = 'ws://' + host + socketPath;
+  try {
+    const version = await fetch('http://' + host + '/json/version', {
+      signal: AbortSignal.timeout(1500), redirect: 'error',
+    });
+    if (version.ok && (await version.json()).webSocketDebuggerUrl === expected) return expected;
+  } catch { /* A previous process can leave a stale profile record. */ }
+  return undefined;
 }
 
-export async function spawnBrowser(visible: boolean = false): Promise<void> {
-  // Ensure virtual audio setup is active
-  try {
-    await import('child_process').then(cp => cp.execFileSync(path.join(os.homedir(), '.local/bin/whatsapp-audio-setup'), ['start'], { stdio: 'ignore' }));
-  } catch {}
+function attach(endpoint: string): Promise<Browser> {
+  return puppeteer.connect({ browserWSEndpoint: endpoint, defaultViewport: null, protocolTimeout: 60000 });
+}
 
-  const standardUserAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+export async function getExistingBrowser(): Promise<Browser | undefined> {
+  const endpoint = await runningEndpoint();
+  if (endpoint) return attach(endpoint);
+}
 
+export async function getBrowser(options: { visible?: boolean } = {}): Promise<Browser> {
+  const existing = await getExistingBrowser();
+  if (existing) return existing;
+  await mkdir(CONFIG.userDataDir, { recursive: true, mode: 0o700 });
   const args = [
-    `--remote-debugging-port=${CONFIG.cdpPort}`,
-    `--user-data-dir=${CONFIG.userDataDir}`,
+    '--remote-debugging-address=127.0.0.1',
+    '--remote-debugging-port=0',
+    '--user-data-dir=' + CONFIG.userDataDir,
     '--no-first-run',
     '--no-default-browser-check',
-    '--use-fake-ui-for-media-stream',
     '--autoplay-policy=no-user-gesture-required',
     '--disable-features=PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies',
-    `--user-agent=${standardUserAgent}`,
+    '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+    ...(options.visible ? ['--window-size=1200,900'] : ['--headless=new', '--window-size=1280,800']),
     CONFIG.homeUrl,
   ];
-
-  if (!visible) {
-    // For headless or background mode
-    args.push('--headless=new');
-    args.push('--window-size=1280,800');
-  } else {
-    args.push('--window-size=1200,900');
-  }
-
   const child = spawn(CONFIG.executablePath, args, {
-    detached: true,
-    stdio: 'ignore',
-    env: {
-      ...process.env,
-      PULSE_SOURCE: CONFIG.virtualSource,
-    },
+    detached: true, stdio: 'ignore', env: { ...process.env, PULSE_SOURCE: CONFIG.virtualSource },
   });
-
+  let launchError: Error | undefined;
+  child.once('error', err => { launchError = err; });
   child.unref();
-
-  // Poll until CDP is up (max 15 seconds)
-  const start = Date.now();
-  while (Date.now() - start < 15000) {
-    if (await isCdpAvailable()) return;
-    await new Promise(r => setTimeout(r, 400));
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (launchError) throw launchError;
+    const endpoint = await runningEndpoint();
+    if (endpoint) return attach(endpoint);
+    if (child.signalCode || (child.exitCode !== null && child.exitCode !== 0))
+      throw new Error('The calling browser exited during startup. Check the executable and dedicated profile.');
+    await new Promise(resolve => setTimeout(resolve, 250));
   }
-  throw new Error('Timed out waiting for Chromium CDP to start.');
+  throw new Error('The calling profile did not publish its debugging endpoint. Close any older calling window using this profile and try again.');
 }
 
-export async function getBrowser(options: { visible?: boolean; forceLaunch?: boolean } = {}): Promise<Browser> {
-  const available = await isCdpAvailable();
-  if (!available || options.forceLaunch) {
-    await spawnBrowser(options.visible ?? false);
-  }
-
-  const browser = await puppeteer.connect({
-    browserURL: CONFIG.cdpUrl,
-    defaultViewport: null,
-    protocolTimeout: 60000,
-  });
-
-  return browser;
+export async function findWhatsAppPage(browser: Browser): Promise<Page | undefined> {
+  return (await browser.pages()).find(page => URL.canParse(page.url()) && new URL(page.url()).origin === CONFIG.homeUrl);
 }
 
 export async function getWhatsAppPage(browser: Browser): Promise<Page> {
-  const pages = await browser.pages();
-  let page = pages.find(p => p.url().includes('web.whatsapp.com'));
-
+  let page = await findWhatsAppPage(browser);
   if (!page) {
     page = await browser.newPage();
-  }
-
-  if (!page.url().includes('web.whatsapp.com')) {
     await page.goto(CONFIG.homeUrl, { waitUntil: 'domcontentloaded' });
+    if (new URL(page.url()).origin !== CONFIG.homeUrl) throw new Error('The calling page did not reach WhatsApp Web.');
   }
-
-  // Override permissions so browser dialogs never pop up
-  try {
-    const context = browser.defaultBrowserContext();
-    await context.overridePermissions(CONFIG.homeUrl, ['microphone', 'camera', 'notifications']);
-  } catch {}
-
+  await browser.defaultBrowserContext().overridePermissions(CONFIG.homeUrl, ['microphone']);
   return page;
 }

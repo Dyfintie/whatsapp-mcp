@@ -47,7 +47,7 @@ export async function openContactChat(page: Page, queryOrPhone: string): Promise
   if (isPhone && !/^\d{7,15}$/.test(target)) {
     throw new Error('Phone numbers must contain 7 to 15 digits, including country code.');
   }
-  console.error(`Locating chat for "${query}"...`);
+  console.error('Locating the requested chat...');
 
   // Dismiss "Use here" if active
   await page.evaluate(() => {
@@ -87,7 +87,7 @@ export async function openContactChat(page: Page, queryOrPhone: string): Promise
     if (matches > 1) throw new Error(`Ambiguous recipient: "${query}" has multiple exact matches.`);
     if (matches === 0) {
       if (!isPhone) throw new Error(`No exact contact match for "${query}".`);
-      console.error(`Navigating to WhatsApp chat for full number ${target}...`);
+      console.error('Opening the chat for the requested phone number...');
       await page.goto(`https://web.whatsapp.com/send?phone=${target}`, { waitUntil: 'domcontentloaded' });
     }
   } else {

@@ -108,7 +108,7 @@ export class CallService {
         if (this.synthesizing >= 2) throw new ServiceError('TTS_BUSY', 'Two voice syntheses are already active.', true);
         ++this.synthesizing;
         try {
-          const base = client.transferRoot ? path.join(client.transferRoot, 'uploads') : os.tmpdir();
+          const base = path.join(client.transferRoot, 'uploads');
           await fs.mkdir(base, { recursive: true, mode: 0o700 });
           dir = await fs.mkdtemp(path.join(base, 'whatsapp-vn-'));
           const wav = path.join(dir, 'voice-note.wav');
